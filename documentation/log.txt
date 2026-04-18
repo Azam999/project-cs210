@@ -1,0 +1,90 @@
+Project: Do Tech Layoffs Help Stock Prices?
+Course: CS 210 — Data Management for Data Science
+Phase: 1 of 5 (Database Architecture & Data Ingestion)
+Status: Complete
+
+What We Built
+In Phase 1, we set up the foundation for the entire project: a database to store our data, and a Python script to load the layoffs dataset into it. Everything after this phase — stock prices, analysis, visualizations — depends on this foundation being solid.
+Think of Phase 1 as pouring the concrete slab before building the house. It's not glamorous, but if it's crooked, everything built on top of it will be crooked too.
+
+The Big Picture: What Problem We Solved
+We started with a CSV file of layoff events downloaded from Kaggle (originally scraped from layoffs.fyi). That file has about 4,300 rows of messy, inconsistent data — some rows have missing values, some companies appear multiple times with slight spelling differences, some dates are unparseable, and percentages are stored as text with "%" signs.
+We needed to turn that mess into a clean, queryable database that the rest of our pipeline can trust. Phase 1 accomplishes exactly that.
+
+Step-by-Step: What We Did
+1. Designed the Database Schema
+We created a PostgreSQL database with five tables, each with a specific job:
+TableWhat It StoresWhy It ExistscompaniesOne row per company (name, industry, HQ, ticker)The "master list" that everything else links back tolayoff_eventsOne row per layoff announcementThe core event data from layoffs.fyidaily_pricesOne row per (company, trading day) stock priceWill hold ~30K rows of stock data in Phase 3market_indexS&P 500 daily pricesOur benchmark for computing "abnormal returns"event_windowsComputed analytical results per eventOutput of our analysis in Phase 4
+Key design principle: each table does one thing. We avoided the beginner mistake of cramming everything into one giant table.
+2. Enforced Data Quality at the Database Level
+The database itself will reject bad data before it ever gets stored. We added:
+
+Primary keys (SERIAL auto-incrementing IDs) so every row has a unique identifier
+Foreign keys so you can't create a layoff event for a company that doesn't exist
+UNIQUE constraints so you can't have two companies named "Meta" or two stock prices for the same company on the same day
+CHECK constraints that reject impossible values (negative employee counts, percentages over 100%, negative stock prices)
+Indexes on the columns we'll query most often, so lookups are fast
+
+3. Built the Ingestion Pipeline
+We wrote ingest_layoffs.py, a Python script that:
+
+Connects to PostgreSQL using credentials stored in a .env file (never hardcoded)
+Loads the layoffs CSV into a pandas DataFrame
+Cleans the data:
+
+Standardizes column names to snake_case
+Strips whitespace from text fields ("Meta " vs "Meta" would otherwise be two companies)
+Parses dates properly, skipping rows with unparseable dates
+Converts text numbers ("12%") to real numbers (12.0)
+Removes duplicate rows, keeping the one with the most complete data
+
+
+Inserts the data in two passes:
+
+Pass 1: Insert unique companies
+Pass 2: Insert layoff events, linking each to the correct company
+
+
+Logs everything — every insert, skip, and error — to a log file we can review later
+
+4. Made the Pipeline Safe to Re-Run
+Every database insert uses ON CONFLICT DO NOTHING, which means if you run the script twice, it won't create duplicates. You can re-run ingestion as many times as you want during development, and the database stays clean. This property is called idempotency, and it's a big deal in data engineering.
+5. Set Up the Project Structure
+We established the repository layout:
+layoffs-analysis/
+├── sql/
+│   └── schema.sql              # Database table definitions
+├── data/
+│   └── layoffs.csv             # Source data (not committed to git)
+├── ingest_layoffs.py           # Phase 1 ingestion script
+├── requirements.txt            # Python dependencies
+├── .env                        # Database credentials (not committed to git)
+├── .env.example                # Template for credentials
+├── .gitignore                  # Tells git what to ignore
+└── README.md                   # Project documentation
+
+Key Decisions We Made (And Why)
+These are the decisions you'll most likely be asked about in your oral exam. Each has a specific rationale behind it.
+Why PostgreSQL instead of SQLite or MongoDB?
+PostgreSQL handles the concurrency we'll need when we fetch stock prices in parallel (Phase 3). It also has stronger constraint enforcement than SQLite. MongoDB was ruled out because our data is inherently relational — events connect to companies which connect to prices — and a document database would force us to either duplicate data or do joins in Python, both of which are slow and error-prone.
+Why Five Tables Instead of One?
+This is called normalization (specifically, Third Normal Form / 3NF). If we stored everything in one giant table, we'd repeat Meta's industry, headquarters, and ticker symbol in every row of Meta's stock prices — that's 30,000 duplicate copies. If Meta's industry ever needed updating, we'd have to update all 30,000 rows and hope we didn't miss any. With normalized tables, Meta's info lives in one place. One row, one update, done.
+Why SERIAL IDs Instead of Ticker Symbols as Primary Keys?
+Tickers change over time. Meta used to be FB. Block used to be SQ. If we used ticker as the primary key, a rename would cascade through every table in our database. With stable numeric IDs, we can update ticker strings freely without breaking any relationships.
+Why NUMERIC Instead of FLOAT for Prices?
+Floating point numbers have small rounding errors built into how computers represent them — 0.1 + 0.2 doesn't exactly equal 0.3 in floating point. Over millions of calculations, these errors compound. NUMERIC gives exact decimal arithmetic. This is standard practice in any system that touches money, and it's the kind of detail that separates "student code" from "production code."
+Why a Two-Pass Ingestion (Companies First, Then Events)?
+Because of foreign key constraints, every layoff event must reference a company that already exists in the database. If we tried to insert both in one pass, we'd have to stop on every row to check whether the company exists yet. Two passes is cleaner: insert all unique companies first, then insert events that reference them. It also mirrors the logical dependency — events depend on companies, so companies come first.
+Why Use errors="coerce" When Parsing Data?
+The alternative is to let one bad row crash the entire ingestion. With coerce, pandas converts unparseable values to NaN (null), and our code handles those nulls explicitly. One malformed row out of 4,300 should not kill the pipeline. This is called graceful degradation, and it's one of the most important principles in data engineering.
+Why Environment Variables for Database Credentials?
+Hardcoding your password into a Python file is a serious security mistake — if you accidentally push that code to GitHub, your password is now public. We store credentials in a .env file that's listed in .gitignore, so it never gets committed. The .env.example file shows the format without containing any real secrets.
+
+What We Learned About the Data
+From the cleaning process, we confirmed several things about our dataset:
+
+~4,300 layoff events spanning multiple years
+~2,800 unique companies (some have done multiple rounds of layoffs)
+Missing data is common: some rows have employee counts but not percentages, or vice versa. Our schema accommodates this by allowing NULLs in both fields.
+Duplicate rows exist in the raw CSV, likely from the source's scraping process. Our deduplication step handles this.
+Not all companies are public: a significant chunk are private startups with no ticker. These will be excluded from the stock analysis in Phase 3 but remain in the database for context.

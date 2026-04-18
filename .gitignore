@@ -1,0 +1,53 @@
+# ---- Environment / secrets ----
+.env
+.env.local
+*.env
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# ---- Distribution / packaging ----
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ---- Logs ----
+*.log
+ingestion.log
+ticker_matching.log
+price_fetch.log
+
+# ---- Data (do not commit raw datasets) ----
+data/*.csv
+data/*.json
+data/*.parquet
+!data/.gitkeep
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Database dumps ----
+*.sql.bak
+*.dump
