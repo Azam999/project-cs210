@@ -88,3 +88,173 @@ From the cleaning process, we confirmed several things about our dataset:
 Missing data is common: some rows have employee counts but not percentages, or vice versa. Our schema accommodates this by allowing NULLs in both fields.
 Duplicate rows exist in the raw CSV, likely from the source's scraping process. Our deduplication step handles this.
 Not all companies are public: a significant chunk are private startups with no ticker. These will be excluded from the stock analysis in Phase 3 but remain in the database for context.
+
+
+====================================================================
+PHASE 2a: TICKER MATCHING
+====================================================================
+Status: Complete
+Date Completed: 2026-04-19
+
+What This Phase Does
+--------------------
+Connects company names in our layoffs database to actual stock ticker
+symbols (like META for Meta, AMZN for Amazon). This mapping is what
+lets the next phase pull stock prices for each company from Yahoo
+Finance. Without tickers, we have no way to look up price history.
+
+Why This Phase Is Harder Than It Looks
+--------------------------------------
+Matching company names to tickers is a classic entity resolution
+problem. Some examples of the mess:
+
+  - "Meta" is easy - matches META directly.
+  - "Google" is not - it trades under GOOGL (Class A), not GOOG.
+  - "Apple" is dangerous - fuzzy-matches "Apple Hospitality REIT"
+    (APLE) by string similarity, which would be completely wrong.
+  - "Twitter" went private in 2022 - there is no ticker anymore.
+  - "Stripe" has never been public - no ticker exists.
+  - "Block" used to be "Square" and traded as SQ before renaming
+    to XYZ in 2024.
+
+There is no single algorithm that gets all of these right. The
+professional answer is a layered strategy that tries the most
+reliable method first and falls back to less reliable methods only
+when needed.
+
+Our Matching Strategy
+---------------------
+Three tiers, tried in order. First hit wins.
+
+  Tier 1: Manual Override Map
+    A hand-curated Python dictionary of about 130 entries mapping
+    lowercase company name to ticker. Built by researching each of
+    the top companies by layoff count. These are human-verified and
+    get confidence score 100. The map also includes explicit "None"
+    entries for known-private companies like Stripe and Databricks,
+    which prevents the next tier from accidentally matching them to
+    something wrong.
+
+  Tier 2: yfinance Direct Validation
+    For companies not in the manual map, we generate plausible ticker
+    candidates from the name (first word, first few letters, acronym)
+    and ask Yahoo Finance if any of them are real tickers. Critically,
+    we do not accept just any response - we verify that the returned
+    ticker's registered company name matches our input using fuzzy
+    string comparison. This is what prevents "Apple" from matching
+    AAP (Advance Auto Parts). Matches get confidence score 85.
+
+  Tier 3: Unresolved
+    Anything the first two tiers miss is marked as unresolved and
+    excluded from stock analysis. Most of these are private startups
+    that wouldn't appear in our analysis anyway.
+
+What We Deliberately Did NOT Do
+-------------------------------
+We did not implement aggressive fuzzy matching against a big corpus
+of ticker symbols. That would increase our match count but at the
+cost of silent wrong matches. For an event study, a confident wrong
+answer is much worse than an admitted gap - a wrong match pollutes
+the analysis invisibly, while a gap is just a missing data point.
+This is called the precision-over-recall tradeoff.
+
+Schema Changes
+--------------
+Added three new columns to the companies table through a new
+migration file (not by editing the original schema):
+
+  match_method        - which tier matched this company (manual,
+                        yf_direct, or unresolved)
+  match_confidence    - 0 to 100, how sure we are about the match
+  match_attempted_at  - timestamp of when matching ran
+
+Also added two CHECK constraints so the database itself enforces that
+if a method is set, confidence must also be set, and that method must
+be one of the three valid values. Plus an index on match_method so
+we can filter by match quality quickly.
+
+Results
+-------
+Out of 2,870 total companies in the database:
+
+  Matched to ticker:  89 companies (3%)
+  Unresolved:         2,781 companies (97%)
+
+At first glance, 3% looks terrible. But the key insight is that tech
+layoffs follow a power-law distribution - a small number of huge
+companies dominate the total impact. Here's the breakdown by total
+employees laid off:
+
+  Matched companies:    441,444 employees laid off (51% of total)
+  Unresolved companies: 431,132 employees laid off (49% of total)
+
+So we captured 51% of the actual layoff impact with just 3% of the
+companies. Amazon alone accounts for about 27,000 layoffs - more
+than thousands of small startup cuts combined. The unresolved
+long tail is overwhelmingly private startups that wouldn't have
+tradeable stock anyway.
+
+Problems We Hit Along The Way
+-----------------------------
+1. Ticker collision crash
+   Two different companies in the layoffs data were both matched to
+   the same ticker "AUR" by the yfinance validator. The database's
+   UNIQUE constraint on ticker_symbol correctly rejected the second
+   one with an IntegrityError, but that crashed our whole script.
+   We fixed this by catching that specific error in our code -
+   when it fires, we demote the colliding company to unresolved
+   and continue processing. The database constraint working as
+   designed actually protected us from bad data.
+
+2. Silent commit failures
+   Our first attempt at the matching loop used nested savepoints
+   inside a batched database connection. SQLAlchemy handled this
+   inconsistently across versions and some updates silently never
+   committed. We rewrote it to use one transaction per row -
+   slower, but clearer and bulletproof.
+
+3. Expanding the manual map mid-phase
+   Our first matching run revealed we were missing several major
+   public companies - Dell, HP, Micron, Wayfair, Unity, and others.
+   The yfinance tier missed them because their short names fell
+   below our similarity threshold. Rather than loosening the
+   threshold (which would introduce false positives), we expanded
+   the manual map from ~60 to ~130 entries, adding the specific
+   companies we'd identified as high-impact gaps. This is the right
+   engineering workflow - measure, identify specific gaps, fix
+   precisely. Don't make the algorithm worse to paper over
+   missing data.
+
+What This Enables
+-----------------
+With 89 companies matched to tickers, Phase 2b can now pull daily
+stock prices from Yahoo Finance for each one. Those prices plus our
+layoff event dates are everything Phase 3 needs to compute whether
+stock prices systematically react to layoff announcements.
+
+What We Can Query Now
+---------------------
+  -- How many companies did we resolve by method?
+  SELECT match_method, COUNT(*) FROM companies GROUP BY match_method;
+
+  -- Find the high-profile companies that got matched
+  SELECT company_name, ticker_symbol FROM companies
+  WHERE match_method = 'manual' ORDER BY company_name;
+
+  -- How much layoff impact did we capture vs miss?
+  SELECT
+    CASE WHEN ticker_symbol IS NOT NULL THEN 'matched' ELSE 'missed' END AS status,
+    COUNT(DISTINCT c.company_id) AS companies,
+    SUM(le.employees_laid_off) AS total_laid_off
+  FROM companies c
+  LEFT JOIN layoff_events le USING (company_id)
+  GROUP BY status;
+
+One Sentence Summary For The Oral Exam
+--------------------------------------
+"We used a layered entity-resolution strategy - hand-curated
+override map, then yfinance validation with fuzzy name verification,
+then fall-through to unresolved - and matched 89 companies covering
+51% of total layoff impact while deliberately avoiding aggressive
+fuzzy matching that would have introduced silent wrong answers."
+====================================================================
