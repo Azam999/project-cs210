@@ -23,6 +23,15 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 # ----------------------------------------------------------------------------
+# Load environment variables from .env file
+# ----------------------------------------------------------------------------
+# python-dotenv reads .env and populates os.environ, so os.getenv() below
+# picks up DB_USER, DB_PASS, etc. without hardcoding them in source.
+from dotenv import load_dotenv
+load_dotenv()
+
+
+# ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 # DB credentials come from environment variables, NOT hardcoded.
@@ -33,7 +42,8 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "layoffs_analysis")
 
-CSV_PATH = Path("data/layoffs.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CSV_PATH = PROJECT_ROOT / "data" / "layoffs.csv"
 
 # Logging configuration — we want a record of every insert, skip, and failure.
 logging.basicConfig(
@@ -117,8 +127,8 @@ def load_and_clean_csv(csv_path: Path) -> pd.DataFrame:
 
     # ---- Step 2d: Coerce numerics ----
     # pd.to_numeric with errors="coerce" gracefully handles "N/A", "", etc.
-    if "num_laid_off" in df.columns:
-        df["num_laid_off"] = pd.to_numeric(df["num_laid_off"], errors="coerce")
+    if "total_laid_off" in df.columns:
+        df["total_laid_off"] = pd.to_numeric(df["total_laid_off"], errors="coerce")
     if "pct" in df.columns:
         # Remove '%' sign if present, then convert.
         df["pct"] = (
@@ -137,7 +147,7 @@ def load_and_clean_csv(csv_path: Path) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["company", "date"], keep="first")
     after = len(df)
     if before != after:
-        logger.info(f"  Deduplicated: {before} → {after} rows")
+        logger.info(f"  Deduplicated: {before} -> {after} rows")
     df = df.drop(columns=["__non_null_count"])
 
     # ---- Step 2f: Normalize company name for matching ----
@@ -164,7 +174,7 @@ def insert_companies(df: pd.DataFrame, engine) -> dict:
         .agg({
             "company": "first",
             "industry": "first",
-            "location_hq": "first",
+            "location": "first",
             "country": "first",
         })
         .reset_index()
@@ -182,7 +192,7 @@ def insert_companies(df: pd.DataFrame, engine) -> dict:
             conn.execute(insert_sql, {
                 "company_name": row["company"],
                 "industry": row["industry"],
-                "headquarters": row["location_hq"],
+                "headquarters": row["location"],
                 "country": row["country"],
             })
 
@@ -231,7 +241,7 @@ def insert_events(df: pd.DataFrame, company_map: dict, engine):
                 result = conn.execute(insert_sql, {
                     "company_id": company_id,
                     "announcement_date": row["date"].date(),
-                    "employees_laid_off": _safe_int(row.get("num_laid_off")),
+                    "employees_laid_off": _safe_int(row.get("total_laid_off")),
                     "percentage_laid_off": _safe_float(row.get("pct")),
                     "funds_raised_usd": _safe_float(row.get("funds_raised")),
                     "stage": row.get("stage"),
