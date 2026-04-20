@@ -110,26 +110,39 @@ Place the file at `data/layoffs.csv`.
 
 ## Running the Pipeline
 
-Run the scripts in order:
+Run the scripts in order from the project root with the venv active:
 
 ```bash
-# Phase 1: Load layoff events
-python ingest_layoffs.py
+# Phase 1: Load layoff events into companies + layoff_events
+python src/ingest_layoffs.py
 
-# Phase 2: Match companies to stock tickers
-python match_tickers.py
+# Phase 2a: Match companies to stock tickers
+psql layoffs_analysis -f sql/add_ticker_metadata.sql   # first run only
+python src/match_tickers.py
 
-# Phase 3: Fetch stock prices via yfinance
-python fetch_prices.py
+# Phase 2b: Fetch daily prices for matched tickers + S&P 500 benchmark
+python src/fetch_prices.py
 
-# Phase 4: Compute event windows and CARs
-python analyze_events.py
+# Phase 3: Event study — abnormal returns, CARs, regression, Random Forest
+psql layoffs_analysis -f sql/add_event_window_uniqueness.sql   # first run only
+python src/analyze_events.py
 
-# Phase 5: Generate visualizations
-python visualize.py
+# Phase 4: Generate the six final plots into reports/figures/
+python src/visualize.py
 ```
 
-Each script writes to its own log file (`*.log`) and is **idempotent** — you can re-run any stage without duplicating data.
+Each script writes to its own log file (`*.log`) and is **idempotent** — you can re-run any stage without duplicating data. Use `python src/analyze_events.py --recompute` to wipe and rebuild the `event_windows` table.
+
+### Pre-registered analysis choices
+
+To avoid multiple-testing shopping:
+
+- **Headline event window**: `(−5, +5)` trading days around the announcement.
+- **Return definition**: log returns, `R(t) = ln(P_t / P_{t−1})`.
+- **Abnormal-return model**: market-adjusted, `AR(t) = R_stock(t) − R_market(t)`, with `^GSPC` as the market.
+- **SCAR estimation window**: `(−250, −31)` trading days before the event.
+
+Other windows (`(−30,+30)`, `(−1,+1)`, `(0,+3)`) are reported as secondary / robustness checks.
 
 ---
 
@@ -194,6 +207,24 @@ For the top ~50 highest-impact companies, fuzzy string matching can silently cho
 ### Why event study methodology?
 
 Event studies are the standard method in financial economics for measuring the impact of a discrete announcement on asset prices (Fama et al., 1969). The "abnormal return" normalizes against market movement, so a 2% stock rise during a 2% market rally contributes zero — isolating company-specific reaction.
+
+---
+
+## Headline Result
+
+After running the pipeline end-to-end on 2,873 companies and 4,335 layoff events (593 belonging to public companies with matched tickers), the headline `(−5, +5)` test finds:
+
+- **Mean CAR = −0.94%** (point estimate, 535 events with complete window data)
+- **Median CAR = +0.03%** (heavy-tailed distribution)
+- **t-statistic = −1.45, p = 0.148** (two-sided t-test) — not significant at α = 0.05
+- **Bootstrap 95% CI = [−2.22%, +0.31%]** (1,000 resamples)
+- **Standardized CAR (SCAR) Patell Z = −1.90, p = 0.058** — borderline, leans negative
+
+**Interpretation.** The data does not support the "Wall Street rewards layoffs" narrative. If anything, the point estimate is mildly negative. We fail to reject the null that mean CAR = 0 at conventional significance levels.
+
+The OLS regression (R² = 0.113) identifies `market_regime_30d`, `log_employees_laid_off`, `log_funds_raised`, and `days_since_prior_layoff` as the leading predictors; the Random Forest classifier on positive-vs-negative CAR achieves 5-fold ROC-AUC ≈ 0.45 — confirming there's no reliable ex-ante signal in these features about the sign of the reaction.
+
+All figures and tables supporting this conclusion are in `reports/figures/` and `reports/tables/`.
 
 ---
 

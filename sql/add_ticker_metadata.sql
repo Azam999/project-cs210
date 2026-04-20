@@ -22,6 +22,7 @@ ALTER TABLE companies
 
 -- Valid values for match_method (enforced via CHECK):
 --   'manual'     = from hardcoded override map (confidence 100)
+--   'yf_search'  = Yahoo Finance search API matched by company name
 --   'yf_direct'  = yfinance recognized the name as a ticker directly
 --   'fuzzy'      = rapidfuzz match against known ticker list
 --   'unresolved' = no match found (likely private)
@@ -29,7 +30,7 @@ ALTER TABLE companies
     ADD CONSTRAINT chk_match_method_valid
     CHECK (
         match_method IS NULL
-        OR match_method IN ('manual', 'yf_direct', 'fuzzy', 'unresolved')
+        OR match_method IN ('manual', 'yf_search', 'yf_direct', 'fuzzy', 'unresolved')
     );
 
 -- Index for filtering by match quality

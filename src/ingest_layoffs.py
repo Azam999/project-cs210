@@ -129,12 +129,12 @@ def load_and_clean_csv(csv_path: Path) -> pd.DataFrame:
     # pd.to_numeric with errors="coerce" gracefully handles "N/A", "", etc.
     if "total_laid_off" in df.columns:
         df["total_laid_off"] = pd.to_numeric(df["total_laid_off"], errors="coerce")
-    if "pct" in df.columns:
+    if "percentage_laid_off" in df.columns:
         # Remove '%' sign if present, then convert.
-        df["pct"] = (
-            df["pct"].astype(str).str.replace("%", "", regex=False)
+        df["percentage_laid_off"] = (
+            df["percentage_laid_off"].astype(str).str.replace("%", "", regex=False)
         )
-        df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
+        df["percentage_laid_off"] = pd.to_numeric(df["percentage_laid_off"], errors="coerce")
     if "funds_raised" in df.columns:
         df["funds_raised"] = pd.to_numeric(df["funds_raised"], errors="coerce")
 
@@ -220,7 +220,21 @@ def insert_events(df: pd.DataFrame, company_map: dict, engine):
             :company_id, :announcement_date, :employees_laid_off,
             :percentage_laid_off, :funds_raised_usd, :stage, :source_url
         )
-        ON CONFLICT (company_id, announcement_date) DO NOTHING
+        ON CONFLICT (company_id, announcement_date) DO UPDATE
+        SET percentage_laid_off = COALESCE(
+                layoff_events.percentage_laid_off,
+                EXCLUDED.percentage_laid_off
+            ),
+            funds_raised_usd = COALESCE(
+                layoff_events.funds_raised_usd,
+                EXCLUDED.funds_raised_usd
+            ),
+            stage = COALESCE(layoff_events.stage, EXCLUDED.stage),
+            source_url = COALESCE(layoff_events.source_url, EXCLUDED.source_url),
+            employees_laid_off = COALESCE(
+                layoff_events.employees_laid_off,
+                EXCLUDED.employees_laid_off
+            )
     """)
 
     inserted = 0
@@ -242,7 +256,7 @@ def insert_events(df: pd.DataFrame, company_map: dict, engine):
                     "company_id": company_id,
                     "announcement_date": row["date"].date(),
                     "employees_laid_off": _safe_int(row.get("total_laid_off")),
-                    "percentage_laid_off": _safe_float(row.get("pct")),
+                    "percentage_laid_off": _safe_float(row.get("percentage_laid_off")),
                     "funds_raised_usd": _safe_float(row.get("funds_raised")),
                     "stage": row.get("stage"),
                     "source_url": row.get("source"),

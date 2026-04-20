@@ -4,10 +4,11 @@ match_tickers.py
 Phase 2a: Resolve company names in the `companies` table to stock ticker symbols.
 
 Strategy (descending confidence):
-  1. Manual override map   - hand-curated, confidence 100
-  2. yfinance direct lookup - try the name as a ticker, validate response
-  3. Fuzzy matching        - DISABLED by design (see comments below)
-  4. Mark as unresolved    - likely private company
+  1. Manual override map    - hand-curated, confidence 100
+  2a. yfinance Search       - name -> ticker via Yahoo search, US equity only
+  2b. yfinance direct       - try heuristic ticker candidates, validate
+  3. Fuzzy matching         - DISABLED by design (see comments below)
+  4. Mark as unresolved     - likely private company
 
 Every match is recorded with a method tag and confidence score so Phase 4
 analysis can filter by match quality if results look suspicious.
@@ -45,6 +46,7 @@ logging.basicConfig(
         logging.FileHandler("ticker_matching.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
+    force=True,  # Override handlers set by ingest_layoffs import
 )
 logger = logging.getLogger(__name__)
 
@@ -223,6 +225,102 @@ MANUAL_TICKER_MAP = {
     "swiggy": None,                      # IPO'd late 2024 but layoffs predate listing
     "ola": None,                         # India private
     "bolt": None,
+
+    # --- Mid-cap additions (Phase 2a expansion) ---
+    "intuit": "INTU",
+    "electronic arts": "EA",
+    "ea": "EA",
+    "synopsys": "SNPS",
+    "applied materials": "AMAT",
+    "lam research": "LRCX",
+    "solaredge": "SEDG",
+    "solaredge technologies": "SEDG",
+    "netapp": "NTAP",
+    "f5": "FFIV",
+    "f5 networks": "FFIV",
+    "capital one": "COF",
+    "godaddy": "GDDY",
+    "yelp": "YELP",
+    "tripadvisor": "TRIP",
+    "sabre": "SABR",
+    "viasat": "VSAT",
+    "chegg": "CHGG",
+    "toast": "TOST",
+    "grab": "GRAB",
+    "playtika": "PLTK",
+    "vacasa": "VCSA",
+    "palantir": "PLTR",
+    "snowflake": "SNOW",
+    "datadog": "DDOG",
+    "mongodb": "MDB",
+    "elastic": "ESTC",
+    "crowdstrike": "CRWD",
+    "sentinelone": "S",
+    "zscaler": "ZS",
+    "cloudflare": "NET",
+    "fastly": "FSLY",
+    "asana": "ASAN",
+    "pagerduty": "PD",
+    "box": "BOX",
+    "ringcentral": "RNG",
+    "vimeo": "VMEO",
+    "nutanix": "NTNX",
+    "teradata": "TDC",
+    "palo alto networks": "PANW",
+    "coupang": "CPNG",
+    "roku": "ROKU",
+    "bumble": "BMBL",
+    "duolingo": "DUOL",
+    "draftkings": "DKNG",
+    "matterport": None,                  # Acquired by CoStar 2024, delisted
+    "offerpad": "OPAD",
+    "smartsheet": "SMAR",
+    "liveperson": "LPSN",
+    "marqeta": "MQ",
+    "outbrain": "OB",
+    "taboola": "TBLA",
+    "udemy": "UDMY",
+    "nerdy": "NRDY",
+    "blend": "BLND",
+    "blackberry": "BB",
+    "plug power": "PLUG",
+    "quantumscape": "QS",
+    "buzzfeed": "BZFD",
+    "clover health": "CLOV",
+    "ginkgo bioworks": "DNA",
+    "rent the runway": "RENT",
+    "getty images": "GETY",
+    "warby parker": "WRBY",
+    "bill.com": "BILL",
+    "deliveroo": None,                   # London listed (ROO.L), not US
+    "ocado": None,                       # London listed (OCDO.L), not US
+    "wisetech": None,                    # ASX listed (WTC.AX), not US
+    "just eat": None,                    # Amsterdam (TKWY.AS), not US
+    "zomato": None,                      # NSE India listing only
+    "flipkart": None,                    # Owned by Walmart, private
+    "yahoo": None,                       # Taken private (Apollo) 2021
+    "qualtrics": None,                   # Taken private 2023
+    "citrix": None,                      # Taken private 2022
+    "kraken": None,                      # Private
+    "shutterfly": None,                  # Private (Apollo)
+    "juul": None,                        # Private
+    "noom": None,                        # Private
+    "magic leap": None,                  # Private
+    "blue origin": None,                 # Private (Bezos)
+    "binance": None,                     # Private
+    "crypto.com": None,                  # Private
+    "gopuff": None,                      # Private
+    "oyo": None,                         # Private at layoff time
+    "wework": None,                      # Bankruptcy/delisted 2023
+    "invitae": None,                     # Bankruptcy 2024, delisted
+    "grubhub": None,                     # Private (owned by Wonder)
+    "sony interactive": None,            # Parent SONY trades, division not separate
+    "olx group": None,                   # Owned by Prosus, not separately traded
+    "indeed + glassdoor": None,          # Owned by Recruit Holdings
+    "informatica": "INFA",
+    "farfetch": None,                    # Delisted 2024, acquired by Coupang
+    "vroom": None,                       # Delisted 2024, restructuring
+    "cruise": None,                      # GM subsidiary, not separately traded
 }
 
 
@@ -286,6 +384,54 @@ def try_yfinance_direct(company_name: str):
     for candidate in candidates:
         if _validate_ticker(candidate, company_name):
             return (candidate, "yf_direct", 85.0)
+
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Strategy 2b: yfinance Search lookup (name -> ticker)
+# ----------------------------------------------------------------------------
+# US primary listing exchange codes returned by Yahoo's search API.
+# NMS/NGM/NCM = NASDAQ tiers, NYQ = NYSE, ASE = NYSE American, PCX = NYSE Arca,
+# BTS = BATS. We deliberately exclude foreign listings (LSE, TSX, SAO, etc.)
+# to keep downstream price history in USD and on one trading calendar.
+_US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE", "PCX", "BTS"}
+
+
+def try_yfinance_search(company_name: str):
+    """
+    Ask Yahoo Finance to search by name, then pick the best US-listed equity
+    whose registered name is fuzzy-similar to the input.
+
+    Returns (ticker, 'yf_search', similarity_score) or None.
+
+    We require:
+      - quoteType == 'EQUITY' (not ETF, index, currency, etc.)
+      - exchange in _US_EXCHANGES (USD, one trading calendar)
+      - token_set_ratio >= 85 (tighter than yf_direct's 70 since Search returns
+        a lot of loosely-related hits)
+    """
+    try:
+        search = yf.Search(company_name, max_results=10)
+        quotes = search.quotes or []
+    except Exception as e:
+        logger.debug(f"  yfinance Search failed for {company_name}: {e}")
+        return None
+
+    for q in quotes:
+        if q.get("quoteType") != "EQUITY":
+            continue
+        if q.get("exchange") not in _US_EXCHANGES:
+            continue
+
+        symbol = q.get("symbol")
+        yf_name = q.get("longname") or q.get("shortname") or ""
+        if not symbol or not yf_name:
+            continue
+
+        similarity = fuzz.token_set_ratio(yf_name.lower(), company_name.lower())
+        if similarity >= 85:
+            return (symbol, "yf_search", float(similarity))
 
     return None
 
@@ -402,7 +548,12 @@ def match_company(row) -> tuple:
     if result is not None:
         return result
 
-    # Strategy 2: yfinance direct (uses original name for better casing)
+    # Strategy 2a: yfinance Search (name -> ticker via Yahoo's search API)
+    result = try_yfinance_search(row["company_name"])
+    if result is not None:
+        return result
+
+    # Strategy 2b: yfinance direct (heuristic ticker candidates)
     result = try_yfinance_direct(row["company_name"])
     if result is not None:
         return result
@@ -483,7 +634,7 @@ def main():
         logger.info("No unmatched companies. Nothing to do.")
         return
 
-    stats = {"manual": 0, "yf_direct": 0, "fuzzy": 0, "unresolved": 0}
+    stats = {"manual": 0, "yf_search": 0, "yf_direct": 0, "fuzzy": 0, "unresolved": 0}
     public_count = 0
 
     # One transaction per row. Simpler than savepoints and bulletproof:
@@ -525,12 +676,13 @@ def main():
 
         # Politeness delay ONLY when we hit the network
         # (manual matches don't touch yfinance).
-        if method == "yf_direct":
+        if method in ("yf_search", "yf_direct", "unresolved"):
             time.sleep(0.1)
 
     logger.info("=" * 60)
     logger.info("Matching complete.")
     logger.info(f"  Manual:     {stats.get('manual', 0)}")
+    logger.info(f"  yf_search:  {stats.get('yf_search', 0)}")
     logger.info(f"  yf_direct:  {stats.get('yf_direct', 0)}")
     logger.info(f"  Fuzzy:      {stats.get('fuzzy', 0)}")
     logger.info(f"  Unresolved: {stats.get('unresolved', 0)}")

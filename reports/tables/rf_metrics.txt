@@ -1,0 +1,6 @@
+n_obs: 505
+pos_rate: 0.499009900990099
+cv_accuracy_mean: 0.48316831683168315
+cv_accuracy_std: 0.07881088610745506
+cv_roc_auc_mean: 0.4563529411764705
+cv_roc_auc_std: 0.08374184530527519

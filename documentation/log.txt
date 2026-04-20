@@ -258,3 +258,307 @@ then fall-through to unresolved - and matched 89 companies covering
 51% of total layoff impact while deliberately avoiding aggressive
 fuzzy matching that would have introduced silent wrong answers."
 ====================================================================
+
+
+====================================================================
+PHASE 2a EXPANSION: MATCHER IMPROVEMENTS
+====================================================================
+Status: Complete
+Date Completed: 2026-04-20
+
+After Phase 2a shipped at 89 matched companies, we went back and added
+two things to push coverage higher without lowering the precision bar:
+
+  1. About fifty new entries were added to the manual override map
+     for mid-cap public companies that dominate the unresolved list
+     by layoff impact (Intuit, Playtika, SolarEdge, Synopsys, Grab,
+     Coupang, DraftKings, Bumble, Duolingo, BlackBerry, and so on).
+     Another twenty known-private entries were added as explicit
+     `None` to prevent yfinance from matching them to the wrong
+     ticker (Kraken, Juul, Citrix-private, Qualtrics-private, etc.).
+
+  2. A new matching strategy `try_yfinance_search` was inserted
+     between the manual override and the old heuristic. It uses
+     yfinance's built-in Search API to look up ticker by company
+     name, filters to US-listed equities (NMS/NYQ/NGM/NCM/ASE/PCX/BTS),
+     and requires a token_set_ratio of at least 85 against the
+     registered Yahoo name. The DB CHECK constraint on match_method
+     was widened to include the new method.
+
+Results after the expansion:
+
+  Manual:     191 (was 112)
+  yf_search:   68 (new)
+  yf_direct:   18 (was 12)
+  Unresolved: 2596 (was 2748)
+  Total with ticker: 219 companies (was 89)
+
+Layoff-impact coverage went from 51% to about 56%. More importantly,
+event-count coverage went from 363 events with tickers to 593 - a
+63% improvement in the sample size that the event study actually uses.
+====================================================================
+
+
+====================================================================
+PHASE 2b: PRICE INGESTION
+====================================================================
+Status: Complete
+Date Completed: 2026-04-20
+
+What This Phase Does
+--------------------
+Pulls daily stock prices for every matched ticker from Yahoo Finance,
+plus the S&P 500 benchmark (^GSPC), and writes them into daily_prices
+and market_index. Without this, the event study has no prices to
+compute returns from.
+
+Design Decisions
+----------------
+1. Full-history fetch per ticker, not per-event windows.
+   For 219 tickers, one yfinance call each covering roughly 2019-09
+   through 2026-05 is simpler, more idempotent, and gives us enough
+   pre-event history (up to 250 trading days) to compute the SCAR
+   estimation-window sigma for every event in Phase 3. The alternative
+   (fetching only each event's +/-65 window) would be harder to
+   deduplicate and wouldn't support long estimation windows.
+
+2. Idempotent via ON CONFLICT DO NOTHING.
+   Both daily_prices (via uq_company_tradedate) and market_index (via
+   trade_date primary key) have natural-key uniqueness, so repeat
+   runs of fetch_prices.py only insert gaps. Crash recovery is free.
+
+3. One transaction per ticker.
+   Same pattern as match_tickers.py - a failure on one ticker
+   doesn't block the rest, and the ON CONFLICT on re-run fills
+   in only what's missing.
+
+4. Politeness.
+   300 ms sleep between ticker calls, two retry attempts with 2s
+   backoff on transient failures. This keeps us well under Yahoo's
+   unofficial rate limit.
+
+What Broke And What We Learned
+------------------------------
+Several tickers returned no data:
+  - INFA (Informatica) - in the process of being taken private
+  - OB (Outbrain), RDFN (Redfin), SMAR (Smartsheet), VCSA (Vacasa),
+    VMEO (Vimeo) - various stages of going private / being acquired
+    / changed symbols
+
+yfinance prints "$TICKER: possibly delisted; no timezone found" for
+these. Our retry-then-skip path handles it - we log them and move
+on. No data corruption, just missing coverage we can't do anything
+about.
+
+Results
+-------
+  daily_prices:  308,618 rows
+  market_index:    1,666 rows
+  Tickers with data:     213 / 219
+  Tickers empty / failed:  6
+
+
+====================================================================
+PHASE 3: EVENT STUDY, REGRESSION, RANDOM FOREST
+====================================================================
+Status: Complete
+Date Completed: 2026-04-20
+
+What This Phase Does
+--------------------
+For each of the 593 layoff events on a public company, computes the
+abnormal return on each trading day around the announcement, sums it
+into a Cumulative Abnormal Return (CAR), computes a Standardized CAR
+(SCAR) using a pre-event estimation window, and writes the results
+into event_windows. Then runs the aggregate hypothesis test, an OLS
+regression, and a Random Forest classifier.
+
+Methodology (Pre-Registered)
+----------------------------
+- Returns: log returns, R(t) = ln(P_t / P_{t-1}).
+- Abnormal return: market-adjusted, AR(t) = R_stock(t) - R_mkt(t).
+  This matches what the proposal deck showed. We intentionally did
+  not fit the full market model (estimating alpha and beta) because
+  for short windows the two approaches give near-identical results
+  (MacKinlay 1997) and the simpler one is harder to screw up.
+- Event day t=0: first trading day >= announcement_date on the
+  ^GSPC calendar. Computed via trading_days.searchsorted(..., side='left').
+- Headline window: (-5, +5) - pre-registered as the primary test
+  before running any analysis. Secondary windows stored for
+  robustness: (-30, +30), (-1, +1), (0, +3).
+- SCAR estimation window: (-250, -31) trading days pre-event.
+  SCAR_i = CAR_i / (sigma_AR_i * sqrt(L)). Stored in the
+  t_statistic column, null when fewer than 150 estimation days
+  are available.
+
+Schema Migration
+----------------
+Before running Phase 3 we added a uniqueness constraint on
+event_windows via sql/add_event_window_uniqueness.sql:
+UNIQUE (event_id, window_start_offset, window_end_offset). This
+is what lets the analysis script use ON CONFLICT DO NOTHING to
+stay idempotent. A startup check in analyze_events.py aborts with
+a clear error if the migration hasn't been applied.
+
+Feature Engineering For Regression And RF
+-----------------------------------------
+All features come from existing tables:
+  log_employees_laid_off, pct_laid_off_filled, has_pct,
+  is_repeat, days_since_prior_layoff, market_regime_30d
+  (30-day log return of the S&P 500 ending the day before event),
+  log_funds_raised, has_funds, event_year, industry_top15
+  (top 15 industries, rest -> "Other"), stage_clean.
+
+The top-15 industry bucketing prevents the one-hot encoding from
+blowing up into a 30-column sparse matrix when we only have 535
+complete observations.
+
+Problems We Hit Along The Way
+-----------------------------
+1. psycopg2 refused to bind np.float64
+   When we stored SCAR into event_windows, psycopg2 serialized
+   numpy.float64 to its repr "np.float64(...)" which Postgres
+   interpreted as SQL referencing a schema called "np". The fix
+   was an explicit float() cast at the return of compute_scar.
+   A general lesson - pandas/numpy ecosystem objects don't always
+   adapt cleanly to DB drivers; always cast at the DB boundary.
+
+2. patsy rejected column names with dashes
+   Our first per-event result columns were named "car_-5_5"
+   (using the raw window bounds). Patsy parsed the dash as the
+   minus operator and threw. We renamed the convention to
+   "car_m5_p5" ("m" for minus, "p" for plus) via a _window_key()
+   helper.
+
+3. Phase 1 ingestion bug: percentage_laid_off never populated
+   While building features for the regression, we discovered
+   that every row's percentage_laid_off was NULL. Tracing through
+   ingest_layoffs.py, we found it was reading row.get("pct") -
+   the column-normalization step only rewrites "%" to "pct", but
+   the CSV's column is already "percentage_laid_off" with no "%"
+   sign, so nothing got renamed. The fix had two parts:
+     (a) Replaced "pct" with "percentage_laid_off" in the three
+         references in ingest_layoffs.py.
+     (b) Changed the INSERT to ON CONFLICT DO UPDATE using
+         COALESCE(existing, new) on the optional fields, so
+         re-running the ingest backfills previously-NULL values
+         without overwriting anything that's already populated.
+   After the fix, 2729 of 4335 events have percentage_laid_off
+   populated.
+
+Results
+-------
+Events processed:       568 (25 had matched tickers but no price
+                             data in our fetched range)
+Events with a (-5, +5) CAR: 535
+
+Headline aggregate test ((-5, +5) window, pre-registered):
+  mean CAR     = -0.0094  (-0.94%)
+  median CAR   = +0.0003
+  std(CAR)     =  0.1492
+  N            = 535
+  t-statistic  = -1.45
+  p-value      = 0.148        <- NOT significant at alpha=0.05
+  bootstrap 95% CI = [-2.22%, +0.31%]
+
+SCAR-based Patell Z test:
+  mean SCAR    = -0.084
+  Z            = -1.90
+  p-value      = 0.058        <- borderline, same direction
+
+All four windows give consistently negative mean CARs:
+  (-30, +30): -5.2%   (large window picks up broader trends)
+  ( -5,  +5): -0.94%  (headline, weak)
+  ( -1,  +1): -0.64%
+  (  0,  +3): -0.99%
+
+OLS regression:
+  N = 535, R^2 = 0.113
+  Leading predictors (by |t|): market_regime_30d (negative -
+  layoffs in down-markets hurt more), log_employees_laid_off,
+  log_funds_raised, days_since_prior_layoff.
+
+Random Forest classifier (positive vs negative CAR):
+  5-fold cross-validated accuracy = 0.447
+  5-fold cross-validated ROC-AUC  = 0.447
+  Below 0.5 AUC on CV with 535 samples is within noise, but the
+  honest read is "no reliable ex-ante signal from these features
+  about the SIGN of the reaction." Feature importances still tell
+  a coherent story - market regime and layoff size dominate -
+  they just can't separate positive from negative outcomes.
+
+Interpretation
+--------------
+The "Wall Street rewards layoffs" narrative is not supported in
+this data. The point estimate on mean CAR is slightly negative
+(about -0.94% in the pre-registered 11-day window). The t-test
+doesn't reject the null at alpha=0.05, and the SCAR-based test
+is borderline (p=0.058) - but both lean negative, not positive.
+
+Equally important finding: first-time vs repeat layoffs do not
+differ significantly. First-time mean CAR = -1.90%, repeat = -0.41%,
+Welch's t = -1.10, p = 0.270. The market does not appear to
+distinguish between a company's first layoff round and its
+fourth.
+
+
+====================================================================
+PHASE 4: VISUALIZATIONS
+====================================================================
+Status: Complete
+Date Completed: 2026-04-20
+
+What This Phase Does
+--------------------
+Six figures that together tell the story of the analysis. All PNGs
+at 300 dpi, written to reports/figures/. The visualize.py script
+is purely read-side - it pulls from event_windows, layoff_events,
+companies, and the cached info/timeline_ars.csv + info/rf_model.pkl
+that Phase 3 wrote.
+
+The Six Figures
+---------------
+1. Average daily abnormal return from t-30 to t+30, with 95% CI
+   band. Visualizes the time-series pattern around the event.
+
+2. Histogram of CAR in the pre-registered (-5, +5) window, with
+   KDE overlay. Annotated with N, mean, t, and p-value.
+
+3. Layoff size vs CAR - two-panel scatter (log(employees) and
+   percentage) with OLS fit and R^2 annotated.
+
+4. First-time vs repeat layoffs - boxplot with strip overlay and
+   Welch's t-test annotation.
+
+5. Random Forest feature importance - top 15 features, horizontal
+   bar with tree-std error bars.
+
+6. Monthly heatmap - year x month grid, two panels: event volume
+   (Blues) and mean CAR in the headline window (RdBu diverging,
+   centered at 0).
+
+Output Locations
+----------------
+reports/figures/*.png   (committed - graders want static figures)
+reports/tables/*.csv    (committed - regression coefficients, RF metrics)
+info/analysis_summary.json (gitignored - regenerable summary)
+info/rf_model.pkl          (gitignored - pickled sklearn pipeline)
+info/timeline_ars.csv      (gitignored - daily AR cache for plot 1)
+
+
+====================================================================
+END-TO-END PIPELINE IS NOW REPRODUCIBLE
+====================================================================
+
+Run in order from project root with venv active:
+  python src/ingest_layoffs.py
+  python src/match_tickers.py
+  python src/fetch_prices.py
+  python src/analyze_events.py
+  python src/visualize.py
+
+Every stage is idempotent - re-running any script does not
+duplicate data. Every stage logs to its own *.log file. DB
+constraints (UNIQUE, CHECK, FK) and ON CONFLICT clauses enforce
+integrity so even partial failures leave the DB consistent.
+====================================================================

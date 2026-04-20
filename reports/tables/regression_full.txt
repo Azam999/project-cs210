@@ -1,0 +1,56 @@
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:              car_m5_p5   R-squared:                       0.090
+Model:                            OLS   Adj. R-squared:                  0.032
+Method:                 Least Squares   F-statistic:                     1.642
+Date:                Mon, 20 Apr 2026   Prob (F-statistic):             0.0202
+Time:                        17:43:11   Log-Likelihood:                 289.51
+No. Observations:                 505   AIC:                            -517.0
+Df Residuals:                     474   BIC:                            -386.1
+Df Model:                          30                                         
+Covariance Type:                  HC3                                         
+=======================================================================================================
+                                          coef    std err          z      P>|z|      [0.025      0.975]
+-------------------------------------------------------------------------------------------------------
+Intercept                               0.5626      0.299      1.884      0.060      -0.023       1.148
+C(industry_top15)[T.Crypto]             0.0603      0.095      0.632      0.527      -0.127       0.247
+C(industry_top15)[T.Data]              -0.0286      0.026     -1.108      0.268      -0.079       0.022
+C(industry_top15)[T.Finance]           -0.0093      0.030     -0.310      0.757      -0.068       0.050
+C(industry_top15)[T.Hardware]          -0.0255      0.021     -1.210      0.226      -0.067       0.016
+C(industry_top15)[T.Healthcare]        -0.0797      0.064     -1.238      0.216      -0.206       0.046
+C(industry_top15)[T.Marketing]          0.0641      0.044      1.470      0.142      -0.021       0.150
+C(industry_top15)[T.Media]              0.0016      0.053      0.029      0.977      -0.103       0.106
+C(industry_top15)[T.Other]             -0.0014      0.021     -0.069      0.945      -0.042       0.040
+C(industry_top15)[T.Real Estate]       -0.1074      0.072     -1.501      0.133      -0.248       0.033
+C(industry_top15)[T.Retail]             0.0049      0.024      0.199      0.842      -0.043       0.053
+C(industry_top15)[T.Sales]             -0.0264      0.033     -0.798      0.425      -0.091       0.038
+C(industry_top15)[T.Security]          -0.0592      0.039     -1.535      0.125      -0.135       0.016
+C(industry_top15)[T.Transportation]    -0.0211      0.034     -0.624      0.532      -0.088       0.045
+C(industry_top15)[T.Travel]            -0.0162      0.023     -0.713      0.476      -0.061       0.028
+C(stage_clean)[T.Post-IPO]             -0.2071      0.057     -3.636      0.000      -0.319      -0.095
+C(stage_clean)[T.Series A]             -0.1966      0.074     -2.649      0.008      -0.342      -0.051
+C(stage_clean)[T.Series B]             -0.1503      0.075     -2.015      0.044      -0.296      -0.004
+C(stage_clean)[T.Series C]             -0.2057      0.093     -2.202      0.028      -0.389      -0.023
+C(stage_clean)[T.Series D]             -0.2151      0.082     -2.630      0.009      -0.375      -0.055
+C(stage_clean)[T.Series F]             -0.0565      3.622     -0.016      0.988      -7.155       7.042
+C(stage_clean)[T.Subsidiary]           -0.1098     29.875     -0.004      0.997     -58.664      58.444
+C(stage_clean)[T.Unknown]              -0.2578      0.081     -3.189      0.001      -0.416      -0.099
+log_employees_laid_off                  0.0032      0.005      0.631      0.528      -0.007       0.013
+pct_laid_off_filled                    -0.1729      0.096     -1.803      0.071      -0.361       0.015
+has_pct                                -0.0248      0.016     -1.569      0.117      -0.056       0.006
+is_repeat                              -0.3142      0.283     -1.112      0.266      -0.868       0.239
+days_since_prior_layoff             -3.437e-05   2.91e-05     -1.183      0.237   -9.13e-05    2.26e-05
+market_regime_30d                       0.0574      0.133      0.433      0.665      -0.203       0.318
+log_funds_raised                        0.0016      0.003      0.576      0.565      -0.004       0.007
+has_funds                              -0.0234      0.021     -1.123      0.261      -0.064       0.017
+==============================================================================
+Omnibus:                       39.899   Durbin-Watson:                   1.910
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):              178.353
+Skew:                           0.064   Prob(JB):                     1.87e-39
+Kurtosis:                       5.909   Cond. No.                     3.76e+05
+==============================================================================
+
+Notes:
+[1] Standard Errors are heteroscedasticity robust (HC3)
+[2] The condition number is large, 3.76e+05. This might indicate that there are
+strong multicollinearity or other numerical problems.
