@@ -1,22 +1,19 @@
 """
 analyze_events.py
------------------
-Phase 3: Event study, hypothesis test, OLS regression, Random Forest.
+Phase 3: the actual event study, plus the OLS regression and Random Forest.
 
-For every layoff event for which we have a matched ticker and sufficient
-price history, we compute abnormal returns, cumulative abnormal returns
-(CAR), and standardized CARs (SCAR) across four analysis windows. Results
-are written back to the event_windows table.
+For every layoff with a matched ticker we compute the abnormal return,
+the Cumulative Abnormal Return (CAR), and the standardized version (SCAR)
+across four windows. Results go into event_windows. Aggregate stuff
+(t-test, regression, RF) gets dumped to reports/ and info/ for the
+visualizer to pick up.
 
-Aggregate outputs (hypothesis test, regression, Random Forest) are written
-to reports/ and info/ for the visualizer and final write-up.
-
-Methodology:
-  - Returns: log returns. R(t) = ln(P_t / P_{t-1}).
-  - Abnormal return: market-adjusted. AR(t) = R_stock(t) - R_mkt(t).
-  - Event day t=0: first trading day >= announcement_date (^GSPC calendar).
-  - Estimation window for SCAR sigma: (-250, -31) before event.
-  - Headline window (pre-registered): (-5, +5).
+Quick reminder on the math:
+  log returns: R(t) = ln(P_t / P_{t-1})
+  abnormal return: AR(t) = R_stock(t) - R_market(t)
+  event day t=0 is the first trading day on or after the announcement
+  estimation window for SCAR sigma is (-250, -31) before the event
+  pre-registered headline window is (-5, +5)
 """
 
 import argparse
@@ -42,9 +39,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# ----------------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------------
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -52,14 +47,12 @@ logging.basicConfig(
         logging.FileHandler("analyze_events.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
-    force=True,  # Override handlers set by ingest_layoffs import
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------------
-# Paths
-# ----------------------------------------------------------------------------
+# paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_DIR = PROJECT_ROOT / "reports"
 TABLES_DIR = REPORTS_DIR / "tables"
@@ -67,16 +60,13 @@ FIGURES_DIR = REPORTS_DIR / "figures"
 INFO_DIR = PROJECT_ROOT / "info"
 
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
+# config
 DEFAULT_WINDOWS = [(-30, 30), (-5, 5), (-1, 1), (0, 3)]
 HEADLINE_WINDOW = (-5, 5)
 
 
 def _window_key(ws: int, we: int) -> str:
-    """Safe column-name key: 'm' for minus, 'p' for plus. Avoids dashes that
-    would break patsy/statsmodels formulas."""
+    """Build a safe column key like 'm5_p5'. Avoids minus signs that break statsmodels."""
     def _part(n):
         return f"m{abs(n)}" if n < 0 else f"p{n}"
     return f"{_part(ws)}_{_part(we)}"
@@ -86,11 +76,8 @@ MIN_ESTIMATION_DAYS = 150
 MIN_WINDOW_COVERAGE = 0.90
 
 
-# ----------------------------------------------------------------------------
-# Migration guard
-# ----------------------------------------------------------------------------
+# bail out early if the migration hasn't been run
 def check_migrations(engine):
-    """Abort early if the event_windows uniqueness migration hasn't been applied."""
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT 1
@@ -106,11 +93,8 @@ def check_migrations(engine):
         sys.exit(2)
 
 
-# ----------------------------------------------------------------------------
-# Data loading
-# ----------------------------------------------------------------------------
+# pull everything into pandas (the dataset is small enough)
 def load_all_data(engine):
-    """Pull everything we need into pandas. Dataset is small (<100 MB)."""
     with engine.connect() as conn:
         events = pd.read_sql(text("""
             SELECT le.event_id, le.company_id, le.announcement_date,
@@ -146,16 +130,8 @@ def load_all_data(engine):
     return events, prices, market
 
 
-# ----------------------------------------------------------------------------
-# Compute log returns
-# ----------------------------------------------------------------------------
+# compute log returns for every company and the market
 def compute_returns(prices: pd.DataFrame, market: pd.DataFrame):
-    """
-    Build:
-      - per-company returns dict: company_id -> DataFrame indexed by trade_date
-        with columns [adj_close, r_stock]
-      - market returns: DataFrame indexed by trade_date with [adj_close, r_mkt]
-    """
     market = market.sort_values("trade_date").copy()
     market["r_mkt"] = np.log(market["adj_close"] / market["adj_close"].shift(1))
     market = market.set_index("trade_date")
@@ -169,11 +145,9 @@ def compute_returns(prices: pd.DataFrame, market: pd.DataFrame):
     return per_company, market
 
 
-# ----------------------------------------------------------------------------
-# Core event-study math
-# ----------------------------------------------------------------------------
+# core event study math
 def align_to_trading_days(announcement_date, trading_days: pd.DatetimeIndex):
-    """Return the integer index t0 of the first trading day >= announcement."""
+    """Find the first trading day at or after the announcement."""
     t0 = trading_days.searchsorted(announcement_date, side="left")
     if t0 >= len(trading_days):
         return None
@@ -188,8 +162,8 @@ def compute_window_stats(
     win_start: int,
     win_end: int,
 ):
-    """Return (car, avg_ar, ar_series) or None if coverage insufficient."""
-    # Window runs from t0+win_start through t0+win_end inclusive
+    """Returns (car, avg_ar, ar_series) or None if we don't have enough data."""
+    # window runs from t0+win_start to t0+win_end inclusive
     lo = t0 + win_start
     hi = t0 + win_end
     if lo < 1 or hi >= len(trading_days):
@@ -198,7 +172,7 @@ def compute_window_stats(
     dates = trading_days[lo : hi + 1]
     expected = len(dates)
 
-    # Pull stock + market returns; both indexed by trade_date
+    # join stock and market returns on the same dates
     merged = market_returns.reindex(dates)[["r_mkt"]].join(
         company_returns.reindex(dates)[["r_stock"]]
     )
@@ -221,11 +195,7 @@ def compute_scar(
     win_end: int,
     car: float,
 ):
-    """
-    SCAR = CAR / (sigma_ar * sqrt(L)) where sigma_ar is estimated on the
-    (-250, -31) pre-event window. Returns None if estimation window has
-    insufficient observations.
-    """
+    """SCAR = CAR / (sigma * sqrt(L)) using the (-250, -31) estimation window."""
     est_lo = t0 + ESTIMATION_START
     est_hi = t0 + ESTIMATION_END
     if est_lo < 1 or est_hi >= len(trading_days):
@@ -248,9 +218,7 @@ def compute_scar(
     return float(car / (sigma * np.sqrt(length)))
 
 
-# ----------------------------------------------------------------------------
 # DB write
-# ----------------------------------------------------------------------------
 _INSERT_WINDOW_SQL = text("""
     INSERT INTO event_windows
         (event_id, window_start_offset, window_end_offset,
@@ -261,13 +229,11 @@ _INSERT_WINDOW_SQL = text("""
 """)
 
 
-# ----------------------------------------------------------------------------
-# Compute & store per-event windows; also collect timeline ARs for viz
-# ----------------------------------------------------------------------------
+# loop over every event, compute and store the windows
 def compute_and_store_events(engine, events, per_company, market_returns, windows):
     trading_days = pd.DatetimeIndex(market_returns.index)
-    timeline_rows = []   # (event_id, offset, ar) for the (-30, +30) plot
-    per_event_results = []  # list of dicts keyed by window string
+    timeline_rows = []   # (event_id, offset, ar) for the timeline plot
+    per_event_results = []
     stats_counts = {"processed": 0, "skipped_no_prices": 0, "skipped_bounds": 0}
 
     for _, ev in events.iterrows():
@@ -309,8 +275,7 @@ def compute_and_store_events(engine, events, per_company, market_returns, window
                 row_result[f"car_{key}"] = car
                 row_result[f"scar_{key}"] = scar
 
-                # Collect per-day ARs for the big (-30, +30) window so we
-                # can draw the average-AR timeline plot in Phase 4.
+                # save daily ARs for the (-30, +30) window so we can plot the timeline
                 if (ws, we) == (-30, 30) and ar_series is not None:
                     for d, ar in ar_series.items():
                         offset = int(trading_days.get_loc(d)) - t0
@@ -333,14 +298,12 @@ def compute_and_store_events(engine, events, per_company, market_returns, window
     return per_event_df, timeline_df
 
 
-# ----------------------------------------------------------------------------
-# Feature engineering for regression + RF
-# ----------------------------------------------------------------------------
+# build features for the regression and the Random Forest
 def engineer_features(events: pd.DataFrame, per_event_df: pd.DataFrame,
                       market_returns: pd.DataFrame):
     df = events.merge(per_event_df, on="event_id", how="left")
 
-    # Repeat-layoff features
+    # repeat layoff features
     df = df.sort_values(["company_id", "announcement_date"]).copy()
     df["event_rank"] = df.groupby("company_id").cumcount() + 1
     df["is_repeat"] = (df["event_rank"] > 1).astype(int)
@@ -350,7 +313,7 @@ def engineer_features(events: pd.DataFrame, per_event_df: pd.DataFrame,
     ).fillna(9999).astype(int)
     df["is_first"] = (df["event_rank"] == 1).astype(int)
 
-    # Size features
+    # size features
     df["log_employees_laid_off"] = np.log1p(df["employees_laid_off"].fillna(
         df["employees_laid_off"].median()
     ))
@@ -361,7 +324,7 @@ def engineer_features(events: pd.DataFrame, per_event_df: pd.DataFrame,
     df["log_funds_raised"] = np.log1p(df["funds_raised_usd"].fillna(0.0).astype(float))
     df["has_funds"] = df["funds_raised_usd"].notna().astype(int)
 
-    # Market regime: 30-day log return on ^GSPC ending the day before event
+    # market regime: 30 day return on the S&P ending the day before the event
     mkt = market_returns.sort_index().copy()
     mkt["r_mkt_30d"] = mkt["r_mkt"].rolling(30, min_periods=20).sum()
     trading_days = pd.DatetimeIndex(mkt.index)
@@ -372,25 +335,23 @@ def engineer_features(events: pd.DataFrame, per_event_df: pd.DataFrame,
         return mkt["r_mkt_30d"].iloc[idx]
     df["market_regime_30d"] = df["announcement_date"].apply(_regime).fillna(0.0)
 
-    # Industry collapsing: top 15, rest -> Other
+    # collapse industry to top 15, everything else becomes "Other"
     top_industries = df["industry"].value_counts().head(15).index.tolist()
     df["industry_top15"] = np.where(
         df["industry"].isin(top_industries), df["industry"], "Other"
     )
     df["industry_top15"] = df["industry_top15"].fillna("Other")
 
-    # Stage: keep raw; null -> "Unknown"
+    # stage as is, NaN becomes "Unknown"
     df["stage_clean"] = df["stage"].fillna("Unknown")
 
-    # Year control
+    # year as a control
     df["event_year"] = df["announcement_date"].dt.year.astype(int)
 
     return df
 
 
-# ----------------------------------------------------------------------------
-# Aggregate hypothesis test
-# ----------------------------------------------------------------------------
+# the headline hypothesis test
 def run_hypothesis_test(per_event_df: pd.DataFrame) -> dict:
     ws, we = HEADLINE_WINDOW
     key = _window_key(ws, we)
@@ -407,7 +368,7 @@ def run_hypothesis_test(per_event_df: pd.DataFrame) -> dict:
     ])
     ci_lo, ci_hi = np.percentile(boot, [2.5, 97.5])
 
-    # SCAR-based test (Patell Z proxy): mean(SCAR) * sqrt(N) ~ N(0,1)
+    # Patell-Z proxy on SCAR: mean(SCAR) * sqrt(N) is approx normal
     scar_col = f"scar_{key}"
     scars = per_event_df[scar_col].dropna().to_numpy()
     scar_z = float(np.mean(scars) * np.sqrt(len(scars))) if len(scars) > 0 else None
@@ -429,9 +390,7 @@ def run_hypothesis_test(per_event_df: pd.DataFrame) -> dict:
     }
 
 
-# ----------------------------------------------------------------------------
-# OLS regression
-# ----------------------------------------------------------------------------
+# OLS regression with HC3 robust standard errors
 def run_regression(df: pd.DataFrame):
     import statsmodels.api as sm
     import statsmodels.formula.api as smf
@@ -451,7 +410,6 @@ def run_regression(df: pd.DataFrame):
     )
     model = smf.ols(formula=formula, data=sub).fit(cov_type="HC3")
 
-    # Coefficients table
     coef_df = pd.DataFrame({
         "coef": model.params,
         "std_err_hc3": model.bse,
@@ -463,9 +421,7 @@ def run_regression(df: pd.DataFrame):
     return model, coef_df
 
 
-# ----------------------------------------------------------------------------
-# Random Forest
-# ----------------------------------------------------------------------------
+# Random Forest classifier (predicts whether CAR is positive or negative)
 def run_random_forest(df: pd.DataFrame):
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import cross_val_score
@@ -509,7 +465,7 @@ def run_random_forest(df: pd.DataFrame):
     acc_scores = cross_val_score(pipe, X, y, scoring="accuracy", cv=5, n_jobs=-1)
     auc_scores = cross_val_score(pipe, X, y, scoring="roc_auc", cv=5, n_jobs=-1)
 
-    # Fit on full data for feature importances
+    # fit on the full data so we can pull out feature importances
     pipe.fit(X, y)
     rf = pipe.named_steps["rf"]
     ohe = pipe.named_steps["prep"].named_transformers_["cat"]
@@ -536,9 +492,7 @@ def run_random_forest(df: pd.DataFrame):
     return pipe, importances, metrics
 
 
-# ----------------------------------------------------------------------------
-# Output writers
-# ----------------------------------------------------------------------------
+# write everything to disk
 def ensure_dirs():
     for p in (REPORTS_DIR, TABLES_DIR, FIGURES_DIR, INFO_DIR):
         p.mkdir(parents=True, exist_ok=True)
@@ -548,17 +502,17 @@ def write_outputs(summary, coef_df, ols_model, rf_pipe, rf_imp, rf_metrics,
                   per_event_df, timeline_df):
     ensure_dirs()
 
-    # Summary JSON
+    # summary JSON
     with open(INFO_DIR / "analysis_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    # Regression outputs
+    # regression
     if coef_df is not None and ols_model is not None:
         coef_df.to_csv(TABLES_DIR / "regression_coefficients.csv", index=True)
         with open(TABLES_DIR / "regression_full.txt", "w") as f:
             f.write(str(ols_model.summary()))
 
-    # RF outputs
+    # RF
     if rf_pipe is not None:
         with open(INFO_DIR / "rf_model.pkl", "wb") as f:
             pickle.dump(rf_pipe, f)
@@ -569,15 +523,13 @@ def write_outputs(summary, coef_df, ols_model, rf_pipe, rf_imp, rf_metrics,
             for k, v in rf_metrics.items():
                 f.write(f"{k}: {v}\n")
 
-    # Per-event CAR table (useful for the viz layer without a DB roundtrip)
+    # per event CARs (so the visualizer can read it without hitting the DB)
     per_event_df.to_csv(INFO_DIR / "per_event_cars.csv", index=False)
-    # Daily-AR timeline (for plot 1)
+    # daily ARs for the timeline plot
     timeline_df.to_csv(INFO_DIR / "timeline_ars.csv", index=False)
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
+# main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recompute", action="store_true",
@@ -617,14 +569,14 @@ def main():
         engine, events, per_company, market_returns, windows
     )
 
-    # Aggregate test on headline window
+    # headline test on (-5, +5)
     summary = run_hypothesis_test(per_event_df)
     logger.info("-" * 60)
     logger.info(f"Hypothesis test on window {HEADLINE_WINDOW}:")
     for k, v in summary.items():
         logger.info(f"  {k}: {v}")
 
-    # Feature engineering for regression + RF
+    # build features and run regression + RF
     features_df = engineer_features(events, per_event_df, market_returns)
 
     ols_model, coef_df = run_regression(features_df)
@@ -645,7 +597,7 @@ def main():
     write_outputs(summary, coef_df, ols_model, rf_pipe, rf_imp, rf_metrics,
                   per_event_df, timeline_df)
 
-    # Row-count check
+    # quick row count sanity check
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT window_start_offset, window_end_offset, COUNT(*)

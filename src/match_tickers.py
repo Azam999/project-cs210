@@ -1,20 +1,10 @@
 """
 match_tickers.py
-----------------
-Phase 2a: Resolve company names in the `companies` table to stock ticker symbols.
+Phase 2a: turn company names into stock tickers.
 
-Strategy (descending confidence):
-  1. Manual override map    - hand-curated, confidence 100
-  2a. yfinance Search       - name -> ticker via Yahoo search, US equity only
-  2b. yfinance direct       - try heuristic ticker candidates, validate
-  3. Fuzzy matching         - DISABLED by design (see comments below)
-  4. Mark as unresolved     - likely private company
-
-Every match is recorded with a method tag and confidence score so Phase 4
-analysis can filter by match quality if results look suspicious.
-
-Idempotent: only processes companies where match_method IS NULL.
-Re-runs are safe and only work on new/unprocessed rows.
+We try the manual map first, then Yahoo's search API. We skip plain fuzzy
+matching because it kept giving wrong answers (Apple matched APLE which is
+a hotel company).
 """
 
 import logging
@@ -29,16 +19,13 @@ from rapidfuzz import fuzz
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-# Load .env FIRST so get_engine() sees DB_PASS.
+# load .env before importing get_engine so it picks up DB_PASS
 load_dotenv()
 
-# Import AFTER load_dotenv so get_engine reads the populated env vars.
 from ingest_layoffs import get_engine
 
 
-# ----------------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------------
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -46,27 +33,16 @@ logging.basicConfig(
         logging.FileHandler("ticker_matching.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
-    force=True,  # Override handlers set by ingest_layoffs import
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------------
-# Manual override map
-# ----------------------------------------------------------------------------
-# Hand-curated mapping of normalized company name (lowercase) -> ticker symbol.
-# Highest-impact companies by layoff count go here; these are NOT fuzzy-matched.
-#
-# Rules:
-#   - Map to the ticker that trades on NYSE or NASDAQ (US primary listing).
-#   - If a company went private or was acquired, set value to None explicitly.
-#   - For dual-class stocks (Google, Meta pre-2022), pick the more liquid class.
-#
-# An explicit `None` is a POSITIVE signal: it tells the matcher "we know this
-# company is private; don't try to fuzzy-match it into something wrong."
-# ----------------------------------------------------------------------------
+# manual map of company name (lowercase) to US ticker
+# we hand pick the top ~50 firms here so we don't get a wrong fuzzy match
+# None means the company is private, don't bother trying to match it
 MANUAL_TICKER_MAP = {
-    # --- Mega-cap tech ---
+    # mega cap tech
     "meta": "META",
     "facebook": "META",
     "google": "GOOGL",
@@ -76,7 +52,7 @@ MANUAL_TICKER_MAP = {
     "apple": "AAPL",
     "netflix": "NFLX",
 
-    # --- Large-cap tech ---
+    # large cap tech
     "salesforce": "CRM",
     "oracle": "ORCL",
     "ibm": "IBM",
@@ -87,11 +63,11 @@ MANUAL_TICKER_MAP = {
     "nvidia": "NVDA",
     "amd": "AMD",
 
-    # --- Hardware / semiconductor / enterprise infra ---
+    # hardware and semiconductors
     "dell": "DELL",
     "dell technologies": "DELL",
-    "hp": "HPQ",                         # HP Inc (consumer)
-    "hewlett packard enterprise": "HPE", # HPE (enterprise spinoff)
+    "hp": "HPQ",                         # HP Inc, the consumer one
+    "hewlett packard enterprise": "HPE", # the enterprise spinoff
     "hpe": "HPE",
     "micron": "MU",
     "micron technology": "MU",
@@ -103,7 +79,7 @@ MANUAL_TICKER_MAP = {
     "nokia": "NOK",
     "philips": "PHG",
     "xerox": "XRX",
-    "toshiba": None,                     # Taken private 2023
+    "toshiba": None,                     # went private in 2023
     "qualcomm": "QCOM",
     "texas instruments": "TXN",
     "arm holdings": "ARM",
@@ -111,7 +87,7 @@ MANUAL_TICKER_MAP = {
     "asml": "ASML",
     "tsmc": "TSM",
 
-    # --- Consumer tech / marketplaces ---
+    # consumer tech and marketplaces
     "uber": "UBER",
     "lyft": "LYFT",
     "airbnb": "ABNB",
@@ -130,7 +106,7 @@ MANUAL_TICKER_MAP = {
     "cargurus": "CARG",
     "chewy": "CHWY",
 
-    # --- Fintech ---
+    # fintech
     "paypal": "PYPL",
     "block": "XYZ",
     "square": "XYZ",
@@ -138,11 +114,11 @@ MANUAL_TICKER_MAP = {
     "coinbase": "COIN",
     "sofi": "SOFI",
     "affirm": "AFRM",
-    "paytm": "PAYTM.NS",                 # India NSE listing
+    "paytm": "PAYTM.NS",                 # India NSE
     "upstart": "UPST",
     "lemonade": "LMND",
 
-    # --- Media / social ---
+    # media and social
     "spotify": "SPOT",
     "snap": "SNAP",
     "snapchat": "SNAP",
@@ -153,7 +129,7 @@ MANUAL_TICKER_MAP = {
     "unity": "U",
     "unity software": "U",
 
-    # --- Enterprise / SaaS ---
+    # enterprise and SaaS
     "zoom": "ZM",
     "docusign": "DOCU",
     "dropbox": "DBX",
@@ -163,7 +139,7 @@ MANUAL_TICKER_MAP = {
     "hubspot": "HUBS",
     "workday": "WDAY",
     "servicenow": "NOW",
-    "splunk": None,                      # Acquired by Cisco 2024
+    "splunk": None,                      # bought by Cisco in 2024
     "coursera": "COUR",
     "autodesk": "ADSK",
     "opentext": "OTEX",
@@ -171,40 +147,40 @@ MANUAL_TICKER_MAP = {
     "amplitude": "AMPL",
     "applovin": "APP",
     "appfolio": "APPF",
-    "indeed": None,                      # Owned by Recruit Holdings (Japan)
-    "linkedin": None,                    # Owned by Microsoft
-    "github": None,                      # Owned by Microsoft
-    "cerner": None,                      # Acquired by Oracle 2022
+    "indeed": None,                      # owned by Recruit Holdings (Japan)
+    "linkedin": None,                    # owned by Microsoft
+    "github": None,                      # owned by Microsoft
+    "cerner": None,                      # bought by Oracle in 2022
 
-    # --- Automotive / hardware ---
+    # automotive and hardware
     "tesla": "TSLA",
     "rivian": "RIVN",
     "lucid motors": "LCID",
     "lucid": "LCID",
     "peloton": "PTON",
-    "fisker": None,                      # Bankrupt 2024
+    "fisker": None,                      # bankrupt 2024
 
-    # --- Real estate / proptech ---
+    # real estate and proptech
     "compass": "COMP",
     "opendoor": "OPEN",
     "redfin": "RDFN",
     "zillow": "Z",
 
-    # --- Companies that went private, acquired, or are otherwise untracked ---
+    # private, acquired, or otherwise untracked
     "twitter": None,
     "x": None,
-    "vmware": None,                      # Acquired by Broadcom 2023
+    "vmware": None,                      # bought by Broadcom in 2023
     "activision": None,
-    "activision blizzard": None,         # Acquired by Microsoft 2023
-    "slack": None,                       # Acquired by Salesforce 2021
-    "zendesk": None,                     # Taken private 2022
-    "katerra": None,                     # Bankrupt 2021
-    "better.com": None,                  # Went public as BETR, but highly illiquid
-    "northvolt": None,                   # Bankrupt 2024
-    "ukg": None,                         # Private (Hellman & Friedman)
-    "amdocs": "DOX",                     # Actually public, NYSE listed
+    "activision blizzard": None,         # bought by Microsoft in 2023
+    "slack": None,                       # bought by Salesforce in 2021
+    "zendesk": None,                     # taken private 2022
+    "katerra": None,                     # bankrupt 2021
+    "better.com": None,                  # listed as BETR but barely trades
+    "northvolt": None,                   # bankrupt 2024
+    "ukg": None,                         # private (Hellman and Friedman)
+    "amdocs": "DOX",                     # actually public on NYSE
 
-    # --- Known-private unicorns ---
+    # known private unicorns
     "stripe": None,
     "databricks": None,
     "spacex": None,
@@ -222,11 +198,11 @@ MANUAL_TICKER_MAP = {
     "getir": None,
     "byju's": None,
     "byjus": None,
-    "swiggy": None,                      # IPO'd late 2024 but layoffs predate listing
+    "swiggy": None,                      # IPO'd late 2024 but layoffs were earlier
     "ola": None,                         # India private
     "bolt": None,
 
-    # --- Mid-cap additions (Phase 2a expansion) ---
+    # mid cap additions added later
     "intuit": "INTU",
     "electronic arts": "EA",
     "ea": "EA",
@@ -272,7 +248,7 @@ MANUAL_TICKER_MAP = {
     "bumble": "BMBL",
     "duolingo": "DUOL",
     "draftkings": "DKNG",
-    "matterport": None,                  # Acquired by CoStar 2024, delisted
+    "matterport": None,                  # acquired by CoStar in 2024, delisted
     "offerpad": "OPAD",
     "smartsheet": "SMAR",
     "liveperson": "LPSN",
@@ -292,49 +268,41 @@ MANUAL_TICKER_MAP = {
     "getty images": "GETY",
     "warby parker": "WRBY",
     "bill.com": "BILL",
-    "deliveroo": None,                   # London listed (ROO.L), not US
-    "ocado": None,                       # London listed (OCDO.L), not US
-    "wisetech": None,                    # ASX listed (WTC.AX), not US
-    "just eat": None,                    # Amsterdam (TKWY.AS), not US
-    "zomato": None,                      # NSE India listing only
-    "flipkart": None,                    # Owned by Walmart, private
-    "yahoo": None,                       # Taken private (Apollo) 2021
-    "qualtrics": None,                   # Taken private 2023
-    "citrix": None,                      # Taken private 2022
-    "kraken": None,                      # Private
-    "shutterfly": None,                  # Private (Apollo)
-    "juul": None,                        # Private
-    "noom": None,                        # Private
-    "magic leap": None,                  # Private
-    "blue origin": None,                 # Private (Bezos)
-    "binance": None,                     # Private
-    "crypto.com": None,                  # Private
-    "gopuff": None,                      # Private
-    "oyo": None,                         # Private at layoff time
-    "wework": None,                      # Bankruptcy/delisted 2023
-    "invitae": None,                     # Bankruptcy 2024, delisted
-    "grubhub": None,                     # Private (owned by Wonder)
-    "sony interactive": None,            # Parent SONY trades, division not separate
-    "olx group": None,                   # Owned by Prosus, not separately traded
-    "indeed + glassdoor": None,          # Owned by Recruit Holdings
+    "deliveroo": None,                   # London, not US
+    "ocado": None,                       # London, not US
+    "wisetech": None,                    # ASX, not US
+    "just eat": None,                    # Amsterdam, not US
+    "zomato": None,                      # India only
+    "flipkart": None,                    # owned by Walmart, private
+    "yahoo": None,                       # taken private (Apollo) in 2021
+    "qualtrics": None,                   # taken private 2023
+    "citrix": None,                      # taken private 2022
+    "kraken": None,
+    "shutterfly": None,
+    "juul": None,
+    "noom": None,
+    "magic leap": None,
+    "blue origin": None,                 # private (Bezos)
+    "binance": None,
+    "crypto.com": None,
+    "gopuff": None,
+    "oyo": None,
+    "wework": None,                      # bankrupt 2023
+    "invitae": None,                     # bankrupt 2024
+    "grubhub": None,                     # private (owned by Wonder)
+    "sony interactive": None,            # parent SONY trades, not the division
+    "olx group": None,                   # owned by Prosus
+    "indeed + glassdoor": None,          # owned by Recruit Holdings
     "informatica": "INFA",
-    "farfetch": None,                    # Delisted 2024, acquired by Coupang
-    "vroom": None,                       # Delisted 2024, restructuring
+    "farfetch": None,                    # delisted 2024, bought by Coupang
+    "vroom": None,                       # delisted 2024
     "cruise": None,                      # GM subsidiary, not separately traded
 }
 
 
-# ----------------------------------------------------------------------------
-# Load unmatched companies from the DB
-# ----------------------------------------------------------------------------
+# only pull companies we haven't tried to match yet so re-runs are safe
 def load_unmatched_companies(engine) -> pd.DataFrame:
-    """
-    Load companies where match_method IS NULL.
-
-    Filtering by NULL makes the script idempotent: already-matched companies
-    are skipped on re-runs. To force re-matching, set match_method to NULL
-    manually: `UPDATE companies SET match_method = NULL WHERE ...;`
-    """
+    """Get companies where match_method is still NULL."""
     query = text("""
         SELECT
             company_id,
@@ -350,67 +318,32 @@ def load_unmatched_companies(engine) -> pd.DataFrame:
     return df
 
 
-# ----------------------------------------------------------------------------
-# Strategy 1: Manual override map
-# ----------------------------------------------------------------------------
+# strategy 1: manual map (just a dict lookup)
 def try_manual_match(normalized_name: str):
-    """
-    O(1) dict lookup. Highest confidence since human-verified.
-
-    Returns:
-      - (ticker_str, 'manual', 100.0) if company is in the map with a ticker
-      - (None, 'manual', 100.0) if company is in the map but is private
-      - None if company is not in the map at all (try next strategy)
-    """
+    """Returns (ticker, 'manual', 100) if in the map, else None."""
     if normalized_name in MANUAL_TICKER_MAP:
         ticker = MANUAL_TICKER_MAP[normalized_name]
         return (ticker, "manual", 100.0)
     return None
 
 
-# ----------------------------------------------------------------------------
-# Strategy 2: yfinance direct lookup
-# ----------------------------------------------------------------------------
+# strategy 2: yfinance direct lookup
+# guess plausible tickers from the name and check yfinance
 def try_yfinance_direct(company_name: str):
-    """
-    Generate plausible ticker candidates from the company name, then ask Yahoo
-    Finance if any of them are real tickers whose registered company name
-    matches our input.
-
-    Returns (ticker, 'yf_direct', 85.0) or None.
-    """
     candidates = _generate_ticker_candidates(company_name)
-
     for candidate in candidates:
         if _validate_ticker(candidate, company_name):
             return (candidate, "yf_direct", 85.0)
-
     return None
 
 
-# ----------------------------------------------------------------------------
-# Strategy 2b: yfinance Search lookup (name -> ticker)
-# ----------------------------------------------------------------------------
-# US primary listing exchange codes returned by Yahoo's search API.
-# NMS/NGM/NCM = NASDAQ tiers, NYQ = NYSE, ASE = NYSE American, PCX = NYSE Arca,
-# BTS = BATS. We deliberately exclude foreign listings (LSE, TSX, SAO, etc.)
-# to keep downstream price history in USD and on one trading calendar.
+# US listings only so prices stay in USD on one trading calendar
+# NMS/NGM/NCM are NASDAQ tiers, NYQ is NYSE, ASE is NYSE American
 _US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE", "PCX", "BTS"}
 
 
+# strategy 2b: search Yahoo by company name and filter to US equities
 def try_yfinance_search(company_name: str):
-    """
-    Ask Yahoo Finance to search by name, then pick the best US-listed equity
-    whose registered name is fuzzy-similar to the input.
-
-    Returns (ticker, 'yf_search', similarity_score) or None.
-
-    We require:
-      - quoteType == 'EQUITY' (not ETF, index, currency, etc.)
-      - exchange in _US_EXCHANGES (USD, one trading calendar)
-      - token_set_ratio >= 85 (tighter than yf_direct's 70 since Search returns
-        a lot of loosely-related hits)
-    """
     try:
         search = yf.Search(company_name, max_results=10)
         quotes = search.quotes or []
@@ -429,6 +362,7 @@ def try_yfinance_search(company_name: str):
         if not symbol or not yf_name:
             continue
 
+        # tighter threshold than yf_direct since search returns lots of loose hits
         similarity = fuzz.token_set_ratio(yf_name.lower(), company_name.lower())
         if similarity >= 85:
             return (symbol, "yf_search", float(similarity))
@@ -437,19 +371,11 @@ def try_yfinance_search(company_name: str):
 
 
 def _generate_ticker_candidates(company_name: str) -> list:
-    """
-    Heuristic ticker candidate generation.
-
-    Real tickers on US exchanges are 1-5 uppercase letters. We generate:
-      - First word of the name, truncated to various lengths
-      - Acronym of capitalized words (e.g., "International Business Machines" -> "IBM")
-
-    Deduplicated while preserving order (first candidate tried first).
-    """
+    """Build plausible ticker guesses from the company name."""
     name = company_name.strip()
     candidates = []
 
-    # Heuristic 1: first word at several lengths
+    # try first word at a few different lengths
     first_word = name.split()[0] if name else ""
     clean = "".join(c for c in first_word if c.isalpha()).upper()
     if 1 <= len(clean) <= 5:
@@ -459,12 +385,12 @@ def _generate_ticker_candidates(company_name: str) -> list:
     if len(clean) >= 3:
         candidates.append(clean[:3])
 
-    # Heuristic 2: acronym of capitalized words
+    # try acronym of capitalized words (e.g. "International Business Machines" gives IBM)
     acronym = "".join(w[0] for w in name.split() if w and w[0].isupper())
     if 2 <= len(acronym) <= 5:
         candidates.append(acronym)
 
-    # Dedupe while preserving order
+    # remove duplicates but keep order
     seen = set()
     result = []
     for c in candidates:
@@ -474,25 +400,13 @@ def _generate_ticker_candidates(company_name: str) -> list:
     return result
 
 
+# check if a ticker is real and matches the company we expected
 def _validate_ticker(ticker: str, expected_name: str) -> bool:
-    """
-    Check whether `ticker` is a real, live ticker AND corresponds to
-    `expected_name`.
-
-    Validation via yfinance:
-      1. Ticker().info must return a non-empty dict with a 'symbol' key
-      2. The registered longName/shortName must have >=70 fuzzy similarity
-         to expected_name (token_set_ratio, case-insensitive)
-
-    Why 70 and not 90? Yahoo's registered names often include legal suffixes
-    ("Apple Inc.", "Meta Platforms, Inc.") that don't appear in colloquial
-    names. token_set_ratio handles this, but we still want some slack.
-    """
     try:
         ticker_obj = yf.Ticker(ticker)
         info = ticker_obj.info
 
-        # yfinance returns near-empty dict for invalid tickers
+        # yfinance gives a near empty dict for fake tickers
         if not info or "symbol" not in info:
             return False
 
@@ -500,85 +414,50 @@ def _validate_ticker(ticker: str, expected_name: str) -> bool:
         if not yf_name:
             return False
 
-        # token_set_ratio ignores word order and duplicates:
-        # "Apple Inc." vs "Apple" scores near 100
+        # threshold of 70 is lenient because Yahoo names include "Inc.", "Corp." etc
         similarity = fuzz.token_set_ratio(yf_name.lower(), expected_name.lower())
         return similarity >= 70
 
     except Exception as e:
-        # yfinance can raise various network/parse errors. Treat any as "no match."
         logger.debug(f"  yfinance validation failed for {ticker}: {e}")
         return False
 
 
-# ----------------------------------------------------------------------------
-# Strategy 3: Fuzzy matching - INTENTIONALLY NOT IMPLEMENTED
-# ----------------------------------------------------------------------------
+# strategy 3: plain fuzzy matching is intentionally off
+# we tried it and it kept matching things wrong (e.g. Apple to Apple Hospitality)
+# better to leave a company unresolved than to get a confidently wrong ticker
 def try_fuzzy_match(company_name: str):
-    """
-    DISABLED BY DESIGN.
-
-    Unconstrained fuzzy matching against an SEC ticker corpus has high
-    false-positive risk. "Apple" could silently match "Apple Hospitality REIT"
-    (APLE) and pollute the entire event study with wrong price data.
-
-    For an event study, precision matters more than recall: a known gap
-    ("unresolved") is safer than a confident wrong answer. Companies not
-    caught by the manual map or yfinance direct validation are marked
-    unresolved and excluded from the stock analysis.
-
-    If expanding later, a proper implementation would:
-      1. Load ~10K known US tickers + long names from SEC EDGAR
-      2. Use rapidfuzz.process.extractOne with a high score_cutoff (>=90)
-      3. Additionally verify via yfinance that the match is live
-    """
     return None
 
 
-# ----------------------------------------------------------------------------
-# Matching cascade
-# ----------------------------------------------------------------------------
+# run all strategies in order, first hit wins
 def match_company(row) -> tuple:
-    """
-    Run the full matching cascade for one company.
-    First hit wins; order matters (manual before yfinance before fuzzy).
-    """
-    # Strategy 1: manual (uses normalized name)
+    # try manual map first
     result = try_manual_match(row["normalized"])
     if result is not None:
         return result
 
-    # Strategy 2a: yfinance Search (name -> ticker via Yahoo's search API)
+    # then Yahoo search
     result = try_yfinance_search(row["company_name"])
     if result is not None:
         return result
 
-    # Strategy 2b: yfinance direct (heuristic ticker candidates)
+    # then guess tickers from the name
     result = try_yfinance_direct(row["company_name"])
     if result is not None:
         return result
 
-    # Strategy 3: fuzzy (disabled)
+    # fuzzy is off
     result = try_fuzzy_match(row["company_name"])
     if result is not None:
         return result
 
-    # Fallback: mark as unresolved
+    # nothing worked, mark unresolved
     return (None, "unresolved", 0.0)
 
 
-# ----------------------------------------------------------------------------
-# Database update
-# ----------------------------------------------------------------------------
+# write the match back to the companies table
 def update_company_match(conn, company_id: int, ticker, method: str, confidence: float):
-    """
-    Write match result back to the companies table.
-
-    If the ticker is already claimed by another company (UNIQUE constraint
-    violation on uq_ticker), this indicates the fuzzy validator accepted
-    an incorrect match. We demote that company to 'unresolved' rather than
-    crashing. The first company to claim a ticker wins.
-    """
     update_sql = text("""
         UPDATE companies
         SET ticker_symbol = :ticker,
@@ -598,14 +477,12 @@ def update_company_match(conn, company_id: int, ticker, method: str, confidence:
             "company_id": company_id,
         })
     except IntegrityError as e:
-        # Ticker already claimed by another company. Demote to unresolved
-        # and log for manual review.
+        # another company already claimed this ticker, demote this one to unresolved
         if "uq_ticker" in str(e.orig):
             logger.warning(
                 f"  Ticker collision: company_id={company_id} tried to claim "
                 f"'{ticker}' but it's already taken. Marking unresolved."
             )
-            # Rollback the failed UPDATE and retry with None/unresolved
             conn.rollback()
             conn.execute(update_sql, {
                 "ticker": None,
@@ -616,12 +493,9 @@ def update_company_match(conn, company_id: int, ticker, method: str, confidence:
                 "company_id": company_id,
             })
         else:
-            # Some other integrity error — re-raise
             raise
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
+# main
 def main():
     logger.info("=" * 60)
     logger.info(f"Ticker matching started at {datetime.now().isoformat()}")
@@ -637,10 +511,7 @@ def main():
     stats = {"manual": 0, "yf_search": 0, "yf_direct": 0, "fuzzy": 0, "unresolved": 0}
     public_count = 0
 
-    # One transaction per row. Simpler than savepoints and bulletproof:
-    # each row either fully commits or fully rolls back, no shared state
-    # between rows. Slower than batching, but for ~2,800 rows it's fine
-    # and the clarity is worth it.
+    # one transaction per row keeps things simple, slower but easier to reason about
     for i, (_, row) in enumerate(unmatched.iterrows(), start=1):
         ticker, method, confidence = match_company(row)
 
@@ -649,9 +520,7 @@ def main():
                 update_company_match(
                     conn, row["company_id"], ticker, method, confidence
                 )
-            # Transaction committed. Update in-memory stats.
-            # Note: update_company_match may have demoted to 'unresolved'
-            # on ticker collision, so re-read what actually got stored.
+            # re-read in case update_company_match demoted us to unresolved
             with engine.connect() as conn:
                 result = conn.execute(
                     text(
@@ -674,8 +543,7 @@ def main():
             logger.error(f"  Failed to process {row['company_name']}: {e}")
             continue
 
-        # Politeness delay ONLY when we hit the network
-        # (manual matches don't touch yfinance).
+        # only sleep when we actually hit the network
         if method in ("yf_search", "yf_direct", "unresolved"):
             time.sleep(0.1)
 

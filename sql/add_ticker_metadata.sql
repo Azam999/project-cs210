@@ -1,17 +1,12 @@
--- ============================================================================
--- Migration 002: Add ticker match metadata to companies table
--- ============================================================================
--- Adds columns to track HOW a ticker was matched and how confident we are.
--- This lets Phase 4 analysis filter by match quality if results look suspicious.
--- ============================================================================
+-- adds match metadata to companies so we know how each ticker was matched
+-- and how confident we are in it
 
 ALTER TABLE companies
     ADD COLUMN IF NOT EXISTS match_method VARCHAR(20),
     ADD COLUMN IF NOT EXISTS match_confidence NUMERIC(5,2),
     ADD COLUMN IF NOT EXISTS match_attempted_at TIMESTAMP;
 
--- Add a CHECK constraint: if method is set, confidence must also be set.
--- This prevents half-populated match metadata.
+-- if method is set, confidence has to be set too (no half-filled metadata)
 ALTER TABLE companies
     ADD CONSTRAINT chk_match_consistency
     CHECK (
@@ -20,12 +15,12 @@ ALTER TABLE companies
         (match_method IS NOT NULL AND match_confidence IS NOT NULL)
     );
 
--- Valid values for match_method (enforced via CHECK):
---   'manual'     = from hardcoded override map (confidence 100)
---   'yf_search'  = Yahoo Finance search API matched by company name
---   'yf_direct'  = yfinance recognized the name as a ticker directly
---   'fuzzy'      = rapidfuzz match against known ticker list
---   'unresolved' = no match found (likely private)
+-- match_method values:
+--   manual: from the hardcoded override map
+--   yf_search: matched via Yahoo's search API
+--   yf_direct: yfinance recognized the ticker directly
+--   fuzzy: rapidfuzz match (currently disabled)
+--   unresolved: no match found, probably private
 ALTER TABLE companies
     ADD CONSTRAINT chk_match_method_valid
     CHECK (
@@ -33,5 +28,5 @@ ALTER TABLE companies
         OR match_method IN ('manual', 'yf_search', 'yf_direct', 'fuzzy', 'unresolved')
     );
 
--- Index for filtering by match quality
+-- index for filtering by match quality
 CREATE INDEX IF NOT EXISTS idx_companies_match_method ON companies(match_method);

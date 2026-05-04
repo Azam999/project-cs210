@@ -1,20 +1,13 @@
 """
 fetch_prices.py
----------------
-Phase 2b: Pull daily stock prices from Yahoo Finance for every matched ticker,
-plus the S&P 500 (^GSPC) benchmark. Writes into `daily_prices` and
-`market_index`.
+Phase 2b: pull daily stock prices from Yahoo Finance for every matched
+ticker, plus the S&P 500 (^GSPC) which we use as the benchmark.
 
-Design notes:
-  - One yfinance call per ticker covering the full date range the project
-    needs. That's strictly more data than we analyze, but it's simpler than
-    event-windowed fetches and lets Phase 3 compute SCAR estimation-window
-    statistics going back up to 250 trading days before each event.
-  - Idempotent: every INSERT uses ON CONFLICT DO NOTHING on the existing
-    unique constraints (uq_company_tradedate, market_index PK). Re-runs
-    only fill gaps.
-  - One transaction per ticker. A failure on one ticker doesn't block the
-    rest, and a retry just re-attempts the missing rows.
+Notes:
+  We pull the full date range for each ticker in one call. It's a bit more
+  data than we need but it makes Phase 3 way simpler.
+  Re-runs are safe because every INSERT is ON CONFLICT DO NOTHING.
+  One transaction per ticker so a single failure doesn't take down the rest.
 """
 
 import logging
@@ -32,9 +25,7 @@ load_dotenv()
 from ingest_layoffs import get_engine
 
 
-# ----------------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------------
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -42,36 +33,28 @@ logging.basicConfig(
         logging.FileHandler("price_fetch.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
-    force=True,  # Override handlers set by ingest_layoffs import
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
-# Start ~6 months before the earliest event (2020-03-11) so there's room for
-# a 250-trading-day SCAR estimation window for the earliest events. End date
-# is today-ish; yfinance will just return whatever is available.
+# config
+# start about 6 months before our earliest event so SCAR has 250 days of history
 FETCH_START = "2019-09-01"
 FETCH_END = "2026-05-31"
 
-# Yahoo tolerates a few queries per second; we stay well under.
+# stay well under Yahoo's rate limit
 SLEEP_BETWEEN_TICKERS = 0.3
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
-# When Yahoo rate-limits ("Too Many Requests"), back off much longer before
-# retrying. The standard cooldown window is 1-15 minutes.
+# if Yahoo says "Too Many Requests" we need to wait way longer
 RATE_LIMIT_BACKOFF_S = 90.0
 
 MARKET_INDEX_SYMBOL = "^GSPC"
 
 
-# ----------------------------------------------------------------------------
-# Load tickers to fetch
-# ----------------------------------------------------------------------------
+# get the list of public companies we resolved in Phase 2a
 def load_tickers(engine) -> pd.DataFrame:
-    """Every public company we resolved in Phase 2a."""
     query = text("""
         SELECT company_id, company_name, ticker_symbol
         FROM companies
@@ -84,14 +67,8 @@ def load_tickers(engine) -> pd.DataFrame:
     return df
 
 
-# ----------------------------------------------------------------------------
-# yfinance fetch + retry
-# ----------------------------------------------------------------------------
+# pull OHLCV history for a ticker, retry on failure
 def fetch_ticker_history(ticker: str) -> pd.DataFrame:
-    """
-    Pull OHLCV history for `ticker`. Returns empty DataFrame on repeated
-    failure — caller decides what to do.
-    """
     last_err = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
@@ -107,7 +84,7 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
         except Exception as e:
             last_err = e
             logger.debug(f"  {ticker}: attempt {attempt} failed: {e}")
-            # "Too Many Requests" needs a long backoff, not a short one.
+            # rate limit needs a longer wait than other errors
             backoff = (RATE_LIMIT_BACKOFF_S if "Too Many Requests" in str(e)
                        else RETRY_BACKOFF_S)
             if attempt < RETRY_ATTEMPTS:
@@ -117,9 +94,7 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ----------------------------------------------------------------------------
-# DB write helpers
-# ----------------------------------------------------------------------------
+# insert price rows, skip duplicates via ON CONFLICT
 _INSERT_PRICE_SQL = text("""
     INSERT INTO daily_prices
         (company_id, trade_date, open_price, close_price, adj_close, volume)
@@ -130,20 +105,14 @@ _INSERT_PRICE_SQL = text("""
 
 
 def upsert_prices(conn, company_id: int, df: pd.DataFrame) -> tuple:
-    """
-    Insert a ticker's history. Returns (inserted_attempts, skipped_invalid).
-
-    "Inserted_attempts" counts rows we *tried* to insert; ON CONFLICT silently
-    skips duplicates, so we don't distinguish between new and existing on the
-    happy path.
-    """
+    """Insert one ticker's price history. Returns (attempted, skipped_invalid)."""
     attempted = 0
     skipped = 0
     for idx, row in df.iterrows():
-        # yfinance index is a DatetimeIndex in local tz; extract date.
+        # yfinance gives us a DatetimeIndex, pull out the date part
         trade_date = idx.date() if hasattr(idx, "date") else pd.Timestamp(idx).date()
         adj_close = row.get("Adj Close")
-        # adj_close is NOT NULL in the schema; rows without it are useless to us.
+        # adj_close is required by the schema, skip rows without it
         if pd.isna(adj_close) or adj_close <= 0:
             skipped += 1
             continue
@@ -198,9 +167,7 @@ def _int_or_none(v):
     return int(v)
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
+# main
 def main():
     logger.info("=" * 60)
     logger.info(f"Price fetch started at {datetime.now().isoformat()}")
@@ -209,7 +176,7 @@ def main():
 
     engine = get_engine()
 
-    # --- Market index first (Phase 3 needs the trading calendar) ---
+    # market index first so Phase 3 has the trading calendar
     logger.info(f"Fetching market index {MARKET_INDEX_SYMBOL}...")
     idx_df = fetch_ticker_history(MARKET_INDEX_SYMBOL)
     if idx_df.empty:
@@ -219,7 +186,7 @@ def main():
         index_rows = upsert_market_index(conn, idx_df)
     logger.info(f"  Market index: {index_rows} rows attempted ({len(idx_df)} days in range)")
 
-    # --- Per-ticker loop ---
+    # then loop through every public company
     tickers = load_tickers(engine)
     n = len(tickers)
     stats = {"ok": 0, "empty": 0, "failed": 0}

@@ -1,15 +1,14 @@
 """
 visualize.py
-------------
-Phase 4: Six final plots for the write-up.
+Phase 4: makes the six final plots for the report.
 
-All figures go to reports/figures/*.png at 300 dpi. This script reads from:
-  - event_windows, layoff_events, companies (SQL)
-  - info/analysis_summary.json (headline hypothesis test)
-  - info/timeline_ars.csv (daily ARs for plot 1)
-  - info/rf_model.pkl + reports/tables/rf_feature_importance.csv (plot 5)
+Saves all figures to reports/figures/*.png at 300 dpi. Reads from:
+  event_windows, layoff_events, companies (SQL)
+  info/analysis_summary.json (for the headline t-test annotations)
+  info/timeline_ars.csv (daily ARs for plot 1)
+  reports/tables/rf_feature_importance.csv (plot 5)
 
-Run `python src/visualize.py` to regenerate all six, or `--only N` for one.
+Run `python src/visualize.py` to make all six, or `--only N` for one.
 """
 
 import argparse
@@ -38,14 +37,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,  # Override handlers set by ingest_layoffs import
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------------
-# Paths
-# ----------------------------------------------------------------------------
+# paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_DIR = PROJECT_ROOT / "reports"
 FIGURES_DIR = REPORTS_DIR / "figures"
@@ -63,9 +60,7 @@ def _save(fig, name):
     logger.info(f"  Saved: {path}")
 
 
-# ----------------------------------------------------------------------------
-# Plot 1: Average daily AR timeline, t-30 to t+30
-# ----------------------------------------------------------------------------
+# plot 1: average daily AR from t-30 to t+30
 def plot_avg_daily_ar(engine):
     path = INFO_DIR / "timeline_ars.csv"
     if not path.exists():
@@ -92,9 +87,7 @@ def plot_avg_daily_ar(engine):
     _save(fig, "1_avg_daily_ar_timeline.png")
 
 
-# ----------------------------------------------------------------------------
-# Plot 2: CAR histogram for (-5, +5) window
-# ----------------------------------------------------------------------------
+# plot 2: histogram of CARs in the (-5, +5) window
 def plot_car_histogram(engine):
     df = pd.read_sql(text("""
         SELECT cumulative_abnormal_return AS car
@@ -109,7 +102,7 @@ def plot_car_histogram(engine):
 
     cars_pct = df["car"].astype(float) * 100
 
-    # Annotate with headline test from summary
+    # add the headline test stats as a text box
     summary_path = INFO_DIR / "analysis_summary.json"
     annotation = ""
     if summary_path.exists():
@@ -125,7 +118,7 @@ def plot_car_histogram(engine):
     ax.axvline(0, color="red", linestyle="--", alpha=0.7, label="CAR = 0")
     ax.axvline(cars_pct.mean(), color="#2b6cb0", linewidth=2,
                label=f"Mean = {cars_pct.mean():+.2f}%")
-    # Clip extreme outliers for readability
+    # clip extreme outliers so the plot is readable
     lo, hi = np.percentile(cars_pct, [1, 99])
     ax.set_xlim(lo * 1.1, hi * 1.1)
     ax.set_xlabel("Cumulative Abnormal Return (%) in ±5 day window")
@@ -139,9 +132,7 @@ def plot_car_histogram(engine):
     _save(fig, "2_car_histogram.png")
 
 
-# ----------------------------------------------------------------------------
-# Plot 3: Layoff size vs CAR
-# ----------------------------------------------------------------------------
+# plot 3: layoff size vs CAR (two scatter plots side by side)
 def plot_size_vs_car(engine):
     df = pd.read_sql(text("""
         SELECT le.employees_laid_off, le.percentage_laid_off,
@@ -160,7 +151,7 @@ def plot_size_vs_car(engine):
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-    # Left: log(employees)
+    # left: log(employees laid off)
     left = df.dropna(subset=["employees_laid_off"])
     left = left[left["employees_laid_off"] > 0]
     if len(left) > 5:
@@ -177,7 +168,7 @@ def plot_size_vs_car(engine):
         axes[0].set_ylabel("CAR (%)")
         axes[0].axhline(0, color="black", linewidth=0.5)
 
-    # Right: percentage (CSV stores fraction 0-1; convert to percent for display)
+    # right: percentage of workforce
     right = df.dropna(subset=["percentage_laid_off"])
     if len(right) > 5:
         pct_pct = right["percentage_laid_off"].astype(float) * 100
@@ -204,9 +195,7 @@ def _linregress(x, y):
     return linregress(x, y)
 
 
-# ----------------------------------------------------------------------------
-# Plot 4: First-time vs repeat
-# ----------------------------------------------------------------------------
+# plot 4: first time vs repeat layoffs
 def plot_first_vs_repeat(engine):
     df = pd.read_sql(text("""
         WITH ranked AS (
@@ -256,22 +245,20 @@ def plot_first_vs_repeat(engine):
     ax.text(0.02, 0.98, annotation, transform=ax.transAxes, fontsize=11,
             verticalalignment="top",
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
-    # Clip to 1-99 percentile for readability
+    # clip to 1 to 99 percentile so outliers don't blow up the y axis
     lo, hi = np.percentile(df["car_pct"], [1, 99])
     ax.set_ylim(lo * 1.15, hi * 1.15)
     _save(fig, "4_first_vs_repeat.png")
 
 
-# ----------------------------------------------------------------------------
-# Plot 5: Random Forest feature importance
-# ----------------------------------------------------------------------------
+# plot 5: top 15 features from the Random Forest
 def plot_rf_importance(engine):
     csv_path = TABLES_DIR / "rf_feature_importance.csv"
     if not csv_path.exists():
         logger.warning("Skipping plot 5: rf_feature_importance.csv not found")
         return
     df = pd.read_csv(csv_path)
-    top = df.head(15).iloc[::-1]  # top 15, reversed for horizontal bar
+    top = df.head(15).iloc[::-1]  # reverse so the biggest bar is on top
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.barh(top["feature"], top["importance_mean"],
@@ -282,9 +269,7 @@ def plot_rf_importance(engine):
     _save(fig, "5_rf_feature_importance.png")
 
 
-# ----------------------------------------------------------------------------
-# Plot 6: Monthly heatmap — event counts + mean CAR
-# ----------------------------------------------------------------------------
+# plot 6: monthly heatmap of event volume + mean CAR
 def plot_monthly_heatmap(engine):
     df = pd.read_sql(text("""
         SELECT DATE_TRUNC('month', le.announcement_date)::date AS month,
@@ -320,7 +305,7 @@ def plot_monthly_heatmap(engine):
     axes[0].set_xlabel("Month")
     axes[0].set_ylabel("Year")
 
-    # Center diverging colormap at 0
+    # center the diverging colormap at 0
     vmax = max(abs(np.nanmin(pivot_car.values)), abs(np.nanmax(pivot_car.values)))
     sns.heatmap(pivot_car, annot=True, fmt=".1f", cmap="RdBu_r", ax=axes[1],
                 center=0, vmin=-vmax, vmax=vmax,
@@ -332,9 +317,7 @@ def plot_monthly_heatmap(engine):
     _save(fig, "6_monthly_heatmap.png")
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
+# main
 PLOTS = [
     ("1", plot_avg_daily_ar),
     ("2", plot_car_histogram),
