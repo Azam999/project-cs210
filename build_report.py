@@ -117,7 +117,7 @@ story = []
 story.append(P("Do Tech Layoffs Help Stock Prices?", title))
 story.append(P("An Event-Study Analysis on 4,300+ Layoff Announcements", subtitle))
 story.append(P("Azam Ahmed, Xuan Liao &nbsp;&middot;&nbsp; CS 210: Data Management for Data Science &nbsp;&middot;&nbsp; Spring 2026", authorline))
-story.append(P("GitHub Repo Link &nbsp;|&nbsp; Demo Video Link", linkline))
+story.append(P("https://github.com/Azam999/project-cs210 &nbsp;|&nbsp; Demo Video Link", linkline))
 
 # ---------- Abstract ----------
 story.append(P("Abstract", h1))
